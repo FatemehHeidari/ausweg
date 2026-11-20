@@ -624,15 +624,17 @@ fn print_proof_summary(r: &prove::ProveReport) {
         };
         println!("- {}: {status}", q.property);
     }
-    let why = r.withheld.join("; ");
     match &r.exit {
         None => {
-            if r.liquidity_proved {
+            if r.full_exit_proved == Some(true) {
                 println!(
                     "- full-exit verdict: proved: from every reachable state of the three-user world, every user who holds shares can redeem all of them in one call, and is paid at least what previewRedeem quoted"
                 );
             } else {
-                println!("- full-exit verdict: withheld: {why}");
+                println!(
+                    "- full-exit verdict: withheld: {}",
+                    r.full_exit_withheld.join("; ")
+                );
             }
             println!(
                 "- not checked: whether payouts are fair; a payout is only compared with the vault's own previewRedeem quote"
@@ -654,7 +656,7 @@ fn print_proof_summary(r: &prove::ProveReport) {
                     "- stages: proved, each on its own, for every user from every state that satisfies the invariant: a user can request all their shares; {fulfil}; a user can claim everything claimable; and no call by alice or the owner shrinks bob's request or lowers the share price. That the stages compose into one exit is argued, not checked: it needs {needs}"
                 );
             } else {
-                println!("- stages: withheld: {why}");
+                println!("- stages: withheld: {}", r.withheld.join("; "));
             }
         }
     }

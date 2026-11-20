@@ -149,14 +149,23 @@ pub struct ProveReport {
     /// maxRedeem, withdrawal at maxWithdraw).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub properties: Vec<Property>,
-    /// The verdict. ERC-4626: full exit, that is init, every keeps check and
-    /// full redemption proved, with every state-changing entry point checked.
-    /// ERC-7540: every check proved, with the same coverage.
+    /// Every check proved, a result for every obligation, and a keeps check for
+    /// every state-changing entry point; as in 0.6, except that an incomplete
+    /// check now counts as not proved. For ERC-7540 this is the verdict.
     pub liquidity_proved: bool,
     /// Why liquidity_proved is false: checks not proved, obligations with no
     /// result, entry points with no keeps check.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub withheld: Vec<String>,
+    /// ERC-4626 only: the full-exit verdict, that is init, every keeps check
+    /// and full redemption proved, with every entry point checked. Unlike
+    /// liquidity_proved it leaves out the two advertised-limit checks, so it
+    /// can be true while `exit withdraw` fails.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub full_exit_proved: Option<bool>,
+    /// Why full_exit_proved is false.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub full_exit_withheld: Vec<String>,
     pub seconds: f64,
     pub mutation: Option<ProofMutation>,
 }
@@ -826,12 +835,28 @@ fn induction(name: &str) -> bool {
     !EXIT_PROPERTIES.iter().any(|(c, _)| *c == name)
 }
 
-/// Each ERC-4626 exit property, and why the main verdict is withheld (empty
-/// when it holds). For ERC-4626 that is the full-exit verdict: the induction
-/// and full redemption. For ERC-7540 it rests on every check.
-pub(crate) fn verdicts(checks: &[Check], proof: &Proof) -> (Vec<Property>, Vec<String>) {
+/// What a run concludes. Each list says why a verdict is withheld, and is
+/// empty when it holds.
+#[derive(Debug)]
+pub(crate) struct Verdicts {
+    /// ERC-4626: each exit property on its own.
+    pub properties: Vec<Property>,
+    /// Every check proved, every obligation with a result, every
+    /// state-changing entry point checked (`liquidity_proved`, as in 0.6).
+    pub liquidity: Vec<String>,
+    /// ERC-4626 only: the full-exit verdict, which rests on the induction and
+    /// full redemption and leaves out the two advertised-limit checks.
+    pub full_exit: Option<Vec<String>>,
+}
+
+pub(crate) fn verdicts(checks: &[Check], proof: &Proof) -> Verdicts {
+    let liquidity = withheld(checks, proof, &|_| true);
     if proof.exit.is_some() {
-        return (Vec::new(), withheld(checks, proof, &|_| true));
+        return Verdicts {
+            properties: Vec::new(),
+            liquidity,
+            full_exit: None,
+        };
     }
     let properties = EXIT_PROPERTIES
         .iter()
@@ -845,7 +870,11 @@ pub(crate) fn verdicts(checks: &[Check], proof: &Proof) -> (Vec<Property>, Vec<S
     let full = withheld(checks, proof, &|n| {
         induction(n) || n == EXIT_PROPERTIES[0].0
     });
-    (properties, full)
+    Verdicts {
+        properties,
+        liquidity,
+        full_exit: Some(full),
+    }
 }
 
 /// One ERC-4626 exit property: its own check's verdict, and whether it is
@@ -1304,8 +1333,7 @@ pub fn run(
     {
         c.witness = Some(witness_start(&c.name, proof.exit.is_some()));
     }
-    let (properties, withheld_why) = verdicts(&checks, &proof);
-    let liquidity_proved = withheld_why.is_empty();
+    let v = verdicts(&checks, &proof);
 
     let mut report = ProveReport {
         contract: contract.display().to_string(),
@@ -1317,9 +1345,11 @@ pub fn run(
         left_out: proof.left_out,
         unchecked: proof.unchecked,
         checks,
-        properties,
-        liquidity_proved,
-        withheld: withheld_why,
+        properties: v.properties,
+        liquidity_proved: v.liquidity.is_empty(),
+        withheld: v.liquidity,
+        full_exit_proved: v.full_exit.as_ref().map(Vec::is_empty),
+        full_exit_withheld: v.full_exit.unwrap_or_default(),
         seconds: 0.0,
         mutation: None,
     };
@@ -1779,25 +1809,28 @@ mod tests {
                 witness: None,
             })
             .collect();
-        let (props, why) = verdicts(&all_proved, &p);
+        let v = verdicts(&all_proved, &p);
+        let why = vec![
+            "batch(uint256[]): no keeps check",
+            "sweep(address[]): no keeps check",
+        ];
+        assert_eq!(v.liquidity, why);
         assert_eq!(
-            why,
-            vec![
-                "batch(uint256[]): no keeps check",
-                "sweep(address[]): no keeps check"
-            ]
+            v.full_exit,
+            Some(why.iter().map(|w| w.to_string()).collect())
         );
         // Each property's own check proved, yet none is proved: the induction
         // misses two transitions.
         assert!(
-            props
+            v.properties
                 .iter()
                 .all(|q| q.verdict == Some(Verdict::Proved) && !q.proved)
         );
         p.unchecked.clear();
-        let (props, why) = verdicts(&all_proved, &p);
-        assert!(why.is_empty());
-        assert!(props.iter().all(|q| q.proved));
+        let v = verdicts(&all_proved, &p);
+        assert!(v.liquidity.is_empty());
+        assert_eq!(v.full_exit, Some(vec![]));
+        assert!(v.properties.iter().all(|q| q.proved));
     }
 
     /// Every check of `p` proved, except those named, with these verdicts.
@@ -1832,8 +1865,12 @@ mod tests {
         // A vault with a valid partial limit: the whole balance cannot go in one
         // call, but both advertised quotes are honored.
         let partial = results(&p, &[("check_exit_redeem", Verdict::Counterexample)]);
-        let (props, why) = verdicts(&partial, &p);
-        let got: Vec<(&str, bool)> = props.iter().map(|q| (q.check.as_str(), q.proved)).collect();
+        let v = verdicts(&partial, &p);
+        let got: Vec<(&str, bool)> = v
+            .properties
+            .iter()
+            .map(|q| (q.check.as_str(), q.proved))
+            .collect();
         assert_eq!(
             got,
             vec![
@@ -1842,21 +1879,42 @@ mod tests {
                 ("check_exit_withdraw", true)
             ]
         );
-        assert_eq!(why, vec!["exit redeem: counterexample"]);
-        // A broken withdraw quote leaves the full-exit verdict standing.
+        assert_eq!(
+            v.full_exit,
+            Some(vec!["exit redeem: counterexample".into()])
+        );
+        assert_eq!(v.liquidity, vec!["exit redeem: counterexample"]);
+        // A broken withdraw quote leaves the full-exit verdict standing, but not
+        // liquidity_proved, which keeps its 0.6 meaning: every check proved.
         let quote = results(&p, &[("check_exit_withdraw", Verdict::Counterexample)]);
-        assert!(verdicts(&quote, &p).1.is_empty());
+        let v = verdicts(&quote, &p);
+        assert_eq!(v.full_exit, Some(vec![]));
+        assert_eq!(v.liquidity, vec!["exit withdraw: counterexample"]);
         // A keeps check cut short by a loop bound withholds everything.
         let cut = results(&p, &[("check_keeps_deposit", Verdict::Incomplete)]);
-        let (props, why) = verdicts(&cut, &p);
+        let v = verdicts(&cut, &p);
+        let why = vec!["keeps deposit: incomplete (Halmos's loop bound cut 1 path short)"];
+        assert_eq!(v.liquidity, why);
         assert_eq!(
-            why,
-            vec!["keeps deposit: incomplete (Halmos's loop bound cut 1 path short)"]
+            v.full_exit,
+            Some(why.iter().map(|w| w.to_string()).collect())
         );
-        assert!(props.iter().all(|q| !q.proved));
+        assert!(v.properties.iter().all(|q| !q.proved));
         // So does an obligation Halmos gave no result for (Error here drops it).
         let missing = results(&p, &[("check_keeps_redeem", Verdict::Error)]);
-        assert_eq!(verdicts(&missing, &p).1, vec!["keeps redeem: no result"]);
+        let v = verdicts(&missing, &p);
+        assert_eq!(v.liquidity, vec!["keeps redeem: no result"]);
+        assert_eq!(v.full_exit, Some(vec!["keeps redeem: no result".into()]));
+        // An ERC-7540 proof has no full-exit verdict: every check counts.
+        p.exit = Some(AsyncExit {
+            progress: crate::asyncproof::Progress::Owner,
+            style: Default::default(),
+            learned: Default::default(),
+        });
+        let v = verdicts(&quote, &p);
+        assert_eq!(v.full_exit, None);
+        assert!(v.properties.is_empty());
+        assert_eq!(v.liquidity, vec!["exit withdraw: counterexample"]);
     }
 
     #[test]
