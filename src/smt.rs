@@ -213,6 +213,8 @@ struct Graph {
     asserts: Vec<usize>,
     /// Declaration order, for a stable output.
     decl_order: Vec<String>,
+    /// `check-sat` commands seen: the translation answers exactly one.
+    check_sats: usize,
 }
 
 fn pow2(n: u32) -> BigUint {
@@ -309,8 +311,18 @@ impl Graph {
                 let id = self.term(&l[1])?;
                 self.asserts.push(id);
             }
-            "set-logic" | "set-info" | "set-option" | "check-sat" | "get-model" | "exit"
-            | "get-value" | "get-unsat-core" | "push" | "pop" => {}
+            // The translation keeps every assertion it reads: a popped one would
+            // stay, and could make a satisfiable query unsat. Such a script
+            // goes to the bit-vector solver unchanged.
+            "push" | "pop" => bail!("{head}: assertion scopes are not translated"),
+            "check-sat" => {
+                self.check_sats += 1;
+                if self.check_sats > 1 {
+                    bail!("more than one check-sat: the translation answers one");
+                }
+            }
+            "set-logic" | "set-info" | "set-option" | "get-model" | "exit" | "get-value"
+            | "get-unsat-core" => {}
             other => bail!("unsupported command {other}"),
         }
         Ok(())
@@ -1612,14 +1624,43 @@ fn staged(script: &str, budget: Duration) -> String {
     )
 }
 
-/// A bit-vector solver for answers the integer query cannot settle.
-fn bv_solver(timeout: Duration) -> Option<Vec<String>> {
+/// Whether a script needs a solver in incremental mode: assertion scopes, or
+/// more than one `check-sat`. yices without `--incremental` ignores `push` and
+/// `pop` and answers as if every assertion held.
+fn needs_incremental(cmds: &[Sexp]) -> bool {
+    fn head(c: &Sexp) -> Option<&str> {
+        c.list().and_then(|l| l.first()).and_then(|h| h.atom())
+    }
+    let mut check_sats = 0;
+    for c in cmds {
+        match head(c) {
+            Some("push" | "pop") => return true,
+            Some("check-sat") => check_sats += 1,
+            _ => {}
+        }
+    }
+    check_sats > 1
+}
+
+/// A bit-vector solver for answers the integer query cannot settle:
+/// `AUSWEG_SMT_FALLBACK`, else yices, else bitwuzla. A script that needs
+/// incremental mode gets yices with `--incremental`, or z3, which reads scopes
+/// natively.
+fn bv_solver(timeout: Duration, incremental: bool) -> Option<Vec<String>> {
     let secs = timeout.as_secs().max(1);
     if let Ok(cmd) = std::env::var("AUSWEG_SMT_FALLBACK") {
         return Some(cmd.split_whitespace().map(String::from).collect());
     }
     if let Some(y) = find_on_path("yices-smt2").or_else(|| halmos_solver("yices-smt2")) {
-        return Some(vec![y.display().to_string(), format!("--timeout={secs}")]);
+        let mut cmd = vec![y.display().to_string(), format!("--timeout={secs}")];
+        if incremental {
+            cmd.push("--incremental".into());
+        }
+        return Some(cmd);
+    }
+    if incremental {
+        let z3 = find_on_path("z3")?;
+        return Some(vec![z3.display().to_string(), format!("-T:{secs}")]);
     }
     let b = find_on_path("bitwuzla").or_else(|| halmos_solver("bitwuzla"))?;
     Some(vec![
@@ -1664,7 +1705,9 @@ fn parse_values(out: &str, vars: &[(String, u32)]) -> Option<Vec<(String, u32, B
 pub fn solve(file: &Path, timeout: Duration) -> Result<(Answer, Option<String>)> {
     let src =
         std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
-    let translated = parse_sexps(&src).and_then(|cmds| {
+    let cmds = parse_sexps(&src);
+    let incremental = cmds.as_ref().is_ok_and(|cs| needs_incremental(cs));
+    let translated = cmds.and_then(|cmds| {
         let mut g = Graph::default();
         for c in &cmds {
             g.command(c)?;
@@ -1680,7 +1723,7 @@ pub fn solve(file: &Path, timeout: Duration) -> Result<(Answer, Option<String>)>
     };
     let fallback = |reason: &str| -> Result<(Answer, Option<String>)> {
         let _ = reason;
-        match bv_solver(remaining()) {
+        match bv_solver(remaining(), incremental) {
             Some(cmd) => {
                 let out = run(&cmd, file)?;
                 let first = out.lines().next().unwrap_or("").trim();
@@ -1786,6 +1829,40 @@ mod tests {
             g.command(&c).unwrap();
         }
         translate(&g)
+    }
+
+    /// What reading the script's commands says: the first refusal, if any.
+    fn read(src: &str) -> std::result::Result<(), String> {
+        let mut g = Graph::default();
+        for c in parse_sexps(src).unwrap() {
+            g.command(&c).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn refuses_assertion_scopes_and_second_check_sats() {
+        // x = 1 is popped before the check: the query is sat (x = 2). Read as
+        // if push and pop were not there, it would be unsat.
+        let scoped = "(declare-fun x () (_ BitVec 8))\n(push 1)\n(assert (= x #x01))\n(pop 1)\n\
+                      (assert (= x #x02))\n(check-sat)";
+        assert_eq!(
+            read(scoped).unwrap_err(),
+            "push: assertion scopes are not translated"
+        );
+        let twice =
+            "(declare-fun x () (_ BitVec 8))\n(check-sat)\n(assert (= x #x01))\n(check-sat)";
+        assert!(
+            read(twice)
+                .unwrap_err()
+                .starts_with("more than one check-sat")
+        );
+        let once = "(declare-fun x () (_ BitVec 8))\n(assert (= x #x01))\n(check-sat)\n(get-model)";
+        assert!(read(once).is_ok());
+        // Both refused scripts go to a solver in incremental mode; a plain one does not.
+        assert!(needs_incremental(&parse_sexps(scoped).unwrap()));
+        assert!(needs_incremental(&parse_sexps(twice).unwrap()));
+        assert!(!needs_incremental(&parse_sexps(once).unwrap()));
     }
 
     #[test]
