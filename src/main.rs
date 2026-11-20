@@ -136,6 +136,10 @@ enum Cmd {
         /// away from mulDiv's 512-bit branch.
         #[arg(long)]
         bound_amounts: bool,
+        /// `halmos --loop`: how far loops are unrolled (Halmos's default is 2).
+        /// A check whose loops hit the bound is reported as bounded, not proved.
+        #[arg(long = "loop")]
+        loop_bound: Option<u32>,
         /// Upper bound on mutants per contract, taken in source order.
         #[arg(long, default_value_t = 100)]
         max_mutants: usize,
@@ -414,6 +418,7 @@ fn main() -> Result<()> {
             solver_timeout,
             no_price,
             bound_amounts,
+            loop_bound,
             max_mutants,
             no_mutation,
             forge_bin,
@@ -432,6 +437,7 @@ fn main() -> Result<()> {
                 bound_amounts,
                 mutation: !no_mutation,
                 max_mutants,
+                loop_bound,
             };
             let mut reports = Vec::new();
             let mut failed = Vec::new();
@@ -513,24 +519,57 @@ fn print_proof_summary(r: &prove::ProveReport) {
         }
         println!("- price: {}", e.learned.price.describe());
     }
+    // What the checks are about: who calls, how the vault is deployed, what
+    // the asset does.
+    let callers = if r.exit.is_some() {
+        "alice, bob, carol and the owner (the deploying contract)"
+    } else {
+        "alice, bob and carol"
+    };
+    println!(
+        "- model: {callers} call every state-changing vault function with any arguments{}; the vault is deployed with a fresh plain ERC-20 asset, then its storage and the asset's are made symbolic; the asset moves only by transfer, approval and minting, up to 2^96 in all",
+        if r.amounts_bounded {
+            ", amounts up to 2^128"
+        } else {
+            ""
+        }
+    );
+    if let Some(e) = &r.exit {
+        println!(
+            "- requests: read at id 0, one per controller; {}",
+            match e.progress {
+                asyncproof::Progress::Owner =>
+                    "the owner fulfils them with fulfillRedeem(controller, shares)",
+                asyncproof::Progress::Time => "they become claimable once a delay passes",
+            }
+        );
+        println!(
+            "- interference: the stable and fair checks protect bob from alice and the owner, assuming neither has an allowance or operator rights over bob's shares; the fair checks start from any state with the shares accounted for"
+        );
+    }
     let n = |v: Verdict| r.checks.iter().filter(|c| c.verdict == v).count();
     println!(
-        "- checks: {} -> {} proved, {} counterexample, {} timeout, {} vacuous, {} error -> {}",
+        "- checks: {} -> {} proved, {} counterexample, {} timeout, {} vacuous, {} incomplete, {} error -> {}",
         r.checks.len(),
         n(Verdict::Proved),
         n(Verdict::Counterexample),
         n(Verdict::Timeout),
         n(Verdict::Vacuous),
+        n(Verdict::Incomplete),
         n(Verdict::Error),
         r.test_file
     );
     for c in &r.checks {
         let v = match c.verdict {
-            Verdict::Proved => "proved",
-            Verdict::Counterexample => "COUNTEREXAMPLE",
-            Verdict::Timeout => "timeout",
-            Verdict::Vacuous => "vacuous (every path cut)",
-            Verdict::Error => "error",
+            Verdict::Proved => "proved".to_string(),
+            Verdict::Counterexample => "COUNTEREXAMPLE".to_string(),
+            Verdict::Timeout => "timeout".to_string(),
+            Verdict::Vacuous => "vacuous (every path cut)".to_string(),
+            Verdict::Incomplete => format!(
+                "INCOMPLETE ({})",
+                c.incomplete.as_deref().unwrap_or("not every path explored")
+            ),
+            Verdict::Error => "error".to_string(),
         };
         let mut line = format!(
             "  - {v}: {} ({:.1}s, {} paths)",
@@ -546,37 +585,78 @@ fn print_proof_summary(r: &prove::ProveReport) {
                 .collect();
             line.push_str(&format!(": {}", vals.join(", ")));
         }
+        if let Some(w) = &c.witness {
+            line.push_str(&format!(" [from {w}]"));
+        }
         println!("{line}");
     }
+    let keeps: Vec<String> = r
+        .checks
+        .iter()
+        .filter_map(|c| c.name.strip_prefix("check_keeps_"))
+        .map(|f| match f.strip_prefix("asset_") {
+            Some(a) => format!("asset.{a}"),
+            None => f.to_string(),
+        })
+        .collect();
+    println!("- keeps checks for: {}", keeps.join(", "));
     if !r.left_out.is_empty() {
         println!("- left out by the model: {}", r.left_out.join(", "));
     }
     for u in &r.unchecked {
         println!("- no keeps check: {}: {}", u.function, u.reason);
     }
-    if r.liquidity_proved {
-        match &r.exit {
-            None => println!(
-                "- liquidity: proved: from every reachable state of the three-user world, every user can redeem every share they hold, and withdraw what maxWithdraw quotes"
-            ),
-            Some(e) => println!(
-                "- liquidity: proved: from every reachable state of the three-user world, every user can get out in three steps{}; no other user, and not the owner, can shrink a request or lower the share price",
-                match e.progress {
-                    asyncproof::Progress::Owner => ", if the owner fulfils requests eventually",
-                    asyncproof::Progress::Time => ", as time passes",
+    for q in &r.properties {
+        let status = if q.proved {
+            "proved".to_string()
+        } else {
+            match q.verdict {
+                Some(Verdict::Proved) => {
+                    "its check passed, but the induction behind it is not established".to_string()
                 }
-            ),
-        }
-    } else if !r.unchecked.is_empty() && r.checks.iter().all(|c| c.verdict == Verdict::Proved) {
-        println!(
-            "- liquidity: not proved: every check passed, but {} has no keeps check, so the induction is incomplete",
-            match r.unchecked.len() {
-                1 => "1 state-changing entry point".to_string(),
-                n => format!("{n} state-changing entry points"),
+                Some(Verdict::Counterexample) => "counterexample".to_string(),
+                Some(Verdict::Timeout) => "timeout".to_string(),
+                Some(Verdict::Vacuous) => "vacuous".to_string(),
+                Some(Verdict::Incomplete) => "incomplete".to_string(),
+                Some(Verdict::Error) => "error".to_string(),
+                None => "no result".to_string(),
             }
-        );
-    } else {
-        println!("- liquidity: not proved (see the checks above)");
+        };
+        println!("- {}: {status}", q.property);
+    }
+    let why = r.withheld.join("; ");
+    match &r.exit {
+        None => {
+            if r.liquidity_proved {
+                println!(
+                    "- full-exit verdict: proved: from every reachable state of the three-user world, every user who holds shares can redeem all of them in one call, and is paid at least what previewRedeem quoted"
+                );
+            } else {
+                println!("- full-exit verdict: withheld: {why}");
+            }
+            println!(
+                "- not checked: whether payouts are fair; a payout is only compared with the vault's own previewRedeem quote"
+            );
+        }
+        Some(e) => {
+            let (fulfil, needs) = match e.progress {
+                asyncproof::Progress::Owner => (
+                    "the owner can make a whole pending request claimable",
+                    "the owner to fulfil",
+                ),
+                asyncproof::Progress::Time => (
+                    "a whole request is claimable once the delay is over",
+                    "the delay to pass",
+                ),
+            };
+            if r.liquidity_proved {
+                println!(
+                    "- stages: proved, each on its own, for every user from every state that satisfies the invariant: a user can request all their shares; {fulfil}; a user can claim everything claimable; and no call by alice or the owner shrinks bob's request or lowers the share price. That the stages compose into one exit is argued, not checked: it needs {needs}"
+                );
+            } else {
+                println!("- stages: withheld: {why}");
+            }
+        }
     }
     if let Some(m) = &r.mutation {
         println!(

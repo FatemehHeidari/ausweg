@@ -1642,6 +1642,22 @@ fn needs_incremental(cmds: &[Sexp]) -> bool {
     check_sats > 1
 }
 
+/// yices as Halmos runs it, so Halmos can read its model: without
+/// `--smt2-model-format` yices writes `(= x #b10)`, which Halmos does not read,
+/// and a counterexample would come back with no values.
+fn yices(path: &Path, secs: u64, incremental: bool) -> Vec<String> {
+    let mut cmd = vec![
+        path.display().to_string(),
+        format!("--timeout={secs}"),
+        "--smt2-model-format".into(),
+        "--bvconst-in-decimal".into(),
+    ];
+    if incremental {
+        cmd.push("--incremental".into());
+    }
+    cmd
+}
+
 /// A bit-vector solver for answers the integer query cannot settle:
 /// `AUSWEG_SMT_FALLBACK`, else yices, else bitwuzla. A script that needs
 /// incremental mode gets yices with `--incremental`, or z3, which reads scopes
@@ -1652,11 +1668,7 @@ fn bv_solver(timeout: Duration, incremental: bool) -> Option<Vec<String>> {
         return Some(cmd.split_whitespace().map(String::from).collect());
     }
     if let Some(y) = find_on_path("yices-smt2").or_else(|| halmos_solver("yices-smt2")) {
-        let mut cmd = vec![y.display().to_string(), format!("--timeout={secs}")];
-        if incremental {
-            cmd.push("--incremental".into());
-        }
-        return Some(cmd);
+        return Some(yices(&y, secs, incremental));
     }
     if incremental {
         let z3 = find_on_path("z3")?;
@@ -1859,6 +1871,18 @@ mod tests {
         );
         let once = "(declare-fun x () (_ BitVec 8))\n(assert (= x #x01))\n(check-sat)\n(get-model)";
         assert!(read(once).is_ok());
+        // yices is run the way Halmos runs it, so Halmos can read its models.
+        let y = yices(Path::new("yices-smt2"), 7, true);
+        assert_eq!(
+            y,
+            [
+                "yices-smt2",
+                "--timeout=7",
+                "--smt2-model-format",
+                "--bvconst-in-decimal",
+                "--incremental"
+            ]
+        );
         // Both refused scripts go to a solver in incremental mode; a plain one does not.
         assert!(needs_incremental(&parse_sexps(scoped).unwrap()));
         assert!(needs_incremental(&parse_sexps(twice).unwrap()));

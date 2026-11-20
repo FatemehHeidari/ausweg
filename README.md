@@ -1,14 +1,14 @@
 # ausweg
 
-Give `ausweg` an ERC-4626 or ERC-7540 vault, and it proves that every user can always get out, or reports a counterexample, or says which checks it could not decide. The specification is built in, so there is none to write per vault: `ausweg` writes the proof for [Halmos](https://github.com/a16z/halmos) from the vault's ABI and one concrete run of the vault.
+Give `ausweg` an ERC-4626 or ERC-7540 vault, and it proves that every user can always get out, or reports a counterexample, or withholds the verdict and says why. The specification is built in, so there is none to write per vault: `ausweg` writes the proof for [Halmos](https://github.com/a16z/halmos) from the vault's ABI and one concrete run of the vault.
 
-The proof is about a model of the vault's world: three users and the owner, and a plain ERC-20 asset (no fees, blocklists or pauses) with a supply of at most 2^96. In it, from every reachable state, each user can redeem every share they hold in one call. In an ERC-7540 vault, each user can get out in three steps (request, fulfilment or a delay, claim) if the owner eventually fulfils requests, and no other user, nor the owner, can shrink a request or lower the share price on the way, unless the user gave them an allowance or operator rights. Ownership changes and calls that need a signature are left out.
+The proof is about a model of the vault's world: three users and the owner, and a plain ERC-20 asset (no fees, blocklists or pauses) with a supply of at most 2^96. In it, from every reachable state, each user can redeem every share they hold in one call, for at least what `previewRedeem` quoted; whether that quote is fair is not checked. In an ERC-7540 vault, each of the three steps (request, fulfilment or a delay, claim) is proved on its own, and so is that no other user, nor the owner, can shrink a request or lower the share price, unless the user gave them an allowance or operator rights. That the steps add up to one exit, if the owner eventually fulfils requests, is argued from them, not checked. Ownership changes and calls that need a signature are left out.
 
-So far: a vault built on Solmate's ERC-4626, 14 of 14 checks proved; OpenZeppelin Community Contracts' ERC-7540 with admin-fulfilled redemptions, unchanged under a 30-line wrapper, 48 of 48.
+So far, with 0.7.0: a vault built on Solmate's ERC-4626, 15 of 15 checks proved, and with them the full-exit verdict; OpenZeppelin Community Contracts' ERC-7540 with admin-fulfilled redemptions, unchanged under a 30-line wrapper, 48 of 48, each step proved on its own.
 
 ## Try it on a vault
 
-`examples/` has two vaults: `SolmateVault`, the smallest concrete vault on Solmate's ERC4626, and `SolmateVaultBug`, the same vault with one planted bug: `convertToAssets` rounds up, where Solmate rounds down. You need Rust, Foundry, Halmos and z3, and no model. In an empty folder:
+Start with two of the vaults in `examples/`: `SolmateVault`, the smallest concrete vault on Solmate's ERC4626, and `SolmateVaultBug`, the same vault with one planted bug: `convertToAssets` rounds up, where Solmate rounds down. You need Rust, Foundry, Halmos and z3, and no model. In an empty folder:
 
 ```sh
 git clone https://github.com/FatemehHeidari/ausweg
@@ -20,24 +20,30 @@ ausweg prove --contract src/SolmateVault.sol --no-mutation
 ausweg prove --contract src/SolmateVaultBug.sol --no-mutation
 ```
 
-Each proof takes a few minutes; `--no-mutation` skips mutation scoring, which reruns the proof on every mutant. The first vault is proved:
+Each proof takes a few minutes; `--no-mutation` skips mutation scoring, which reruns the proof on every mutant. For the first vault, each exit property is proved, and so is the full-exit verdict:
 
 ```
-- checks: 14 -> 14 proved, 0 counterexample, 0 timeout, 0 vacuous, 0 error -> test/generated/SolmateVault.proof.t.sol
-- liquidity: proved: from every reachable state of the three-user world, every user can redeem every share they hold, and withdraw what maxWithdraw quotes
+- checks: 15 -> 15 proved, 0 counterexample, 0 timeout, 0 vacuous, 0 incomplete, 0 error -> test/generated/SolmateVault.proof.t.sol
+- full redemption (the whole balance, in one call): proved
+- redemption at a positive maxRedeem quote: proved
+- withdrawal at a positive maxWithdraw quote: proved
+- full-exit verdict: proved: from every reachable state of the three-user world, every user who holds shares can redeem all of them in one call, and is paid at least what previewRedeem quoted
 ```
 
-The second is not:
+The second vault still lets every user redeem everything, so the full-exit verdict holds, but its `maxWithdraw` quote is wrong:
 
 ```
-- checks: 14 -> 13 proved, 1 counterexample, 0 timeout, 0 vacuous, 0 error -> test/generated/SolmateVaultBug.proof.t.sol
-  - COUNTEREXAMPLE: exit withdraw (2.3s, 33 paths): i = carol, totalAssets = 4, totalSupply = 3, userShares = 1
-- liquidity: not proved (see the checks above)
+- checks: 15 -> 14 proved, 1 counterexample, 0 timeout, 0 vacuous, 0 incomplete, 0 error -> test/generated/SolmateVaultBug.proof.t.sol
+  - COUNTEREXAMPLE: exit withdraw (3.4s, 33 paths): i = carol, totalAssets = 4, totalSupply = 3, userShares = 1 [from a state that satisfies the invariant; not shown reachable from deployment]
+- full redemption (the whole balance, in one call): proved
+- redemption at a positive maxRedeem quote: proved
+- withdrawal at a positive maxWithdraw quote: counterexample
+- full-exit verdict: proved: from every reachable state of the three-user world, every user who holds shares can redeem all of them in one call, and is paid at least what previewRedeem quoted
 ```
 
-In this run, carol holds 1 of 3 shares, and the vault holds 4 assets. `maxWithdraw` rounds 4/3 up and promises her 2 assets. Withdrawing 2 assets costs 2·3/4 = 1.5 shares, rounded up to 2, and she has 1, so her withdraw reverts.
+In this run, carol holds 1 of 3 shares, and the vault holds 4 assets. `maxWithdraw` rounds 4/3 up and promises her 2 assets. Withdrawing 2 assets costs 2·3/4 = 1.5 shares, rounded up to 2, and she has 1, so her withdraw reverts. The state is one the solver picked among those that satisfy the invariant; this one is reachable (deposit 3, then send the vault 1 asset), but ausweg does not show that.
 
-What this does not prove: that what the vault pays is fair. In the bug vault, `redeem` still lets everyone out, so that check is proved, yet it pays carol 2 assets for a share worth 4/3, and alice and bob lose the difference. The ERC-4626 proof checks that every user can get out with what the vault promises, not that the promise is fair.
+What this does not prove: that what the vault pays is fair. A payout is only compared with the vault's own `previewRedeem` quote for the same shares, which ERC-4626 requires it to honor. In the bug vault, `redeem` lets everyone out, so full redemption is proved, yet it pays carol 2 assets for a share worth 4/3, and alice and bob lose the difference. A vault whose quotes were all 1 wei would pass the payout check just as well.
 
 ## Overview
 
@@ -50,11 +56,11 @@ Two commands generate tests:
 
 One command proves, with no model:
 
-- `ausweg prove` (Step 13): for an ERC-4626 vault, a [Halmos](https://github.com/a16z/halmos) proof that every user can always get out: from every reachable state, each user can redeem every share they hold, in one call, and withdraw what `maxWithdraw` quotes. Halmos runs with ausweg's own solver back end (`ausweg smt`), which rewrites its bit-vector queries into integer arithmetic. The rewrite is exact except for a few operations with no simple integer form, such as a bitwise and of two unknown words: those become uninterpreted functions, so an `unsat` answer still holds, and a `sat` answer goes to a bit-vector solver on the original query.
+- `ausweg prove` (Step 13): for an ERC-4626 vault, a [Halmos](https://github.com/a16z/halmos) proof that every user can always get out: from every reachable state, each user can redeem every share they hold, in one call. Redeeming what `maxRedeem` quotes and withdrawing what `maxWithdraw` quotes are checked too, each reported on its own. Halmos runs with ausweg's own solver back end (`ausweg smt`), which rewrites its bit-vector queries into integer arithmetic. The rewrite is exact except for a few operations with no simple integer form, such as a bitwise and of two unknown words: those become uninterpreted functions, so an `unsat` answer still holds, and a `sat` answer goes to a bit-vector solver on the original query.
 
 `ausweg bench` (Step 14) compares `ausweg smt` with Halmos's own solvers on the same checks.
 
-For an ERC-7540 vault, whose exits take three calls (request, fulfil or wait, claim), `ausweg prove` (Step 15) proves that every user can get out in those three steps, if the owner eventually fulfils requests or time passes, and that no other user, nor the owner, can shrink a user's request or lower the share price on the way.
+For an ERC-7540 vault, whose exits take three calls (request, fulfil or wait, claim), `ausweg prove` (Step 15) proves each step on its own, and that no other user, nor the owner, can shrink a user's request or lower the share price. That the steps add up to one exit, if the owner eventually fulfils requests or time passes, is argued from them, not checked.
 
 Step 16 runs that proof on [OpenZeppelin's ERC-7540](https://docs.openzeppelin.com/community-contracts/erc7540), whose accounting depends on private running totals and a virtual-share price. The probe now reads both, `ausweg smt` reads Halmos's form of a checked subtraction, and the invariant counts a view that reverts after a call as broken.
 
@@ -158,42 +164,55 @@ Each invariant runs `--invariant-runs` (default 32) sequences of `--invariant-de
 
 ### `ausweg prove` output
 
-From a run on `examples/SolmateVault.sol`, mutation scoring left out (`--no-mutation`):
+From a 0.7.0 run on `examples/SolmateVault.sol`, mutation scoring left out (`--no-mutation`):
 
 ```
 ## src/SolmateVault.sol (prove)
 - invariant: alice, bob, carol hold every share and asset token; asset supply <= 2^96; share price >= 1
-- checks: 14 -> 14 proved, 0 counterexample, 0 timeout, 0 vacuous, 0 error -> test/generated/SolmateVault.proof.t.sol
-  - proved: exit redeem (1.3s, 30 paths)
-  - proved: exit withdraw (1.9s, 33 paths)
+- model: alice, bob and carol call every state-changing vault function with any arguments; the vault is deployed with a fresh plain ERC-20 asset, then its storage and the asset's are made symbolic; the asset moves only by transfer, approval and minting, up to 2^96 in all
+- checks: 15 -> 15 proved, 0 counterexample, 0 timeout, 0 vacuous, 0 incomplete, 0 error -> test/generated/SolmateVault.proof.t.sol
+  - proved: exit max_redeem (1.6s, 30 paths)
+  - proved: exit redeem (1.7s, 30 paths)
+  - proved: exit withdraw (2.5s, 33 paths)
   - proved: init (0.1s, 1 paths)
-  - proved: keeps deposit (16.2s, 440 paths)
+  - proved: keeps deposit (64.6s, 452 paths)
   - ...
-  - proved: keeps withdraw (38.8s, 959 paths)
+  - proved: keeps withdraw (70.9s, 1031 paths)
+- keeps checks for: approve, asset.approve, asset.mint, asset.transfer, asset.transferFrom, deposit, mint, redeem, transfer, transferFrom, withdraw
 - left out by the model: permit (needs a signature)
-- liquidity: proved: from every reachable state of the three-user world, every user can redeem every share they hold, and withdraw what maxWithdraw quotes
-- time: 148s
+- full redemption (the whole balance, in one call): proved
+- redemption at a positive maxRedeem quote: proved
+- withdrawal at a positive maxWithdraw quote: proved
+- full-exit verdict: proved: from every reachable state of the three-user world, every user who holds shares can redeem all of them in one call, and is paid at least what previewRedeem quoted
+- not checked: whether payouts are fair; a payout is only compared with the vault's own previewRedeem quote
+- time: 288s
 ```
 
 | Check | What it proves |
 | --- | --- |
 | `init` | A fresh deployment satisfies the invariant. |
 | `keeps <f>` | From any state that satisfies the invariant, `<f>` keeps it, for any of the three users as caller and any arguments. One per state-changing function of the vault, plus the asset's `transfer`, `transferFrom`, `approve` and `mint` (yield or new funds, up to the supply cap). |
-| `exit redeem` | From any state that satisfies the invariant, each user who holds shares redeems all of them in one call: no revert, at least what `previewRedeem` promised, and no shares left. |
-| `exit withdraw` | Each user withdraws what `maxWithdraw` quotes, without a revert, burning at most what `previewWithdraw` says. |
+| `exit redeem` | Full redemption. From any state that satisfies the invariant, each user who holds shares redeems all of them in one call: no revert, a payout of at least what `previewRedeem` quoted for that balance, and no shares left. A balance whose quote rounds to 0 is still in scope: it must redeem and clear. A user with no shares has nothing to redeem and is skipped. |
+| `exit max_redeem` | Redemption at the advertised limit. When `maxRedeem` quotes a positive amount, redeeming exactly that succeeds, pays at least `previewRedeem`, and burns exactly those shares. A quote of 0 promises nothing and is skipped. |
+| `exit withdraw` | Withdrawal at the advertised limit. When `maxWithdraw` quotes a positive amount, withdrawing it succeeds, burns at most what `previewWithdraw` says, and transfers exactly that amount. |
 | left out by the model | A state-changing function the model excludes on purpose, with why: `permit` needs a signature. |
-| no keeps check | A state-changing entry point the proof cannot call: one with an argument it cannot fill in (an array, a struct, `bytes`, a `string`), a payable function (its check sends no ether), or a fallback or receive function. Any one of them withholds "liquidity: proved". |
-| liquidity proved | Every check proved, and every state-changing entry point has its keeps check: by induction, every reachable state satisfies the invariant, and from each one every user can get out. |
-| counterexample | A state, with its numbers named (`totalSupply`, `totalAssets`, `userShares`, the user), where the check fails. |
+| no keeps check | A state-changing entry point the proof cannot call: one with an argument it cannot fill in (an array, a struct, `bytes`, a `string`), a payable function (its check sends no ether), or a fallback or receive function. Any one of them withholds the verdict. |
+| full-exit verdict | `init`, every `keeps` check and `exit redeem` proved, every obligation with a result, and every state-changing entry point with its keeps check: by induction, every reachable state satisfies the invariant, and from each one every user can redeem their whole balance in one call. The two advertised-limit checks are reported on their own lines and are not part of it. Otherwise the line says `withheld` and lists why. |
+| counterexample | A state, with its numbers named (`totalSupply`, `totalAssets`, `userShares`, the user), where the check fails. Only `init`'s starts at deployment; every other one is a state the solver picked among those that satisfy the invariant, and the line says it is not shown reachable from deployment. |
 | timeout, vacuous | The solver ran out of `--solver-timeout` (default 60 s per query); or every path was cut by an assumption, so nothing was checked. |
+| incomplete | Halmos passed the check without exploring every path: its loop bound (`--loop`, 2 by default) cut some paths short, or its result did not say how many it cut. Not a proof; `ausweg prove --loop N` raises the bound. |
 
 Since 0.6.1, `exit redeem` takes the user's whole balance rather than what `maxRedeem` quotes, and a preview or max view that reverts fails the check: Halmos drops a path that reverts, so the state would otherwise go unchecked. `examples/HalfExitVault.sol` lets a user take out at most half their shares at a time, rounded down, so a last share is stuck. 0.6.0 proved it; 0.6.1 reports `COUNTEREXAMPLE: exit redeem: i = carol, totalAssets = 2, totalSupply = 2, userShares = 2`.
 
-Since 0.6.2, a state-changing function with no keeps check withholds the verdict, since the induction then misses a transition. `examples/SweepVault.sol` lets anyone send all of the vault's assets away with `sweep(address[])`, which the proof cannot call. 0.6.0 proved it; 0.6.2 reports `no keeps check: sweep(address[]): takes address[], which the proof cannot fill in` and `liquidity: not proved`.
+Since 0.6.2, a state-changing function with no keeps check withholds the verdict, since the induction then misses a transition. `examples/SweepVault.sol` lets anyone send all of the vault's assets away with `sweep(address[])`, which the proof cannot call. 0.6.0 proved it; 0.6.2 reports `no keeps check: sweep(address[]): takes address[], which the proof cannot fill in` and `liquidity: not proved`; 0.7.0, `full-exit verdict: withheld: sweep(address[]): no keeps check`.
+
+Since 0.7.0, the three exit properties are reported on their own, and the full-exit verdict rests on full redemption: `init`, every keeps check, every entry point covered, and `exit redeem`. ERC-4626 lets a vault cap what one call takes, if `maxRedeem` and `maxWithdraw` say so. `examples/CapRedeemVault.sol` takes at most 100 shares per call. It honors what it advertises, so both limit checks are proved, but full redemption is not: `COUNTEREXAMPLE: exit redeem: i = carol, totalAssets = 129, totalSupply = 128, userShares = 128`. Carol holds all 128 shares and the vault 129 assets. `maxWithdraw` quotes `convertToAssets(100)` = ⌊100·129/128⌋ = 100 assets, and withdrawing them burns ⌈100·128/129⌉ = 100 shares, within the cap. `redeem(128)` asks for more than `maxRedeem` = 100 and reverts. She can get out in two calls, 100 shares and then 28, but the verdict is about one call, so it is withheld.
+
+Since 0.7.0, a check that Halmos passes without exploring every path is incomplete, and withholds the verdict. Halmos stops following a loop after `--loop` iterations (2 by default) and still prints `[PASS]`, with exit code 0; it warns, and its JSON result counts the cut paths in `num_bounded_loops`. `examples/LoopVault.sol` adds a `ping(n)` whose loop runs up to 3 times. 0.6.0 proved it; 0.7.0 reports `INCOMPLETE (Halmos's loop bound cut 3 paths short; rerun with a higher --loop): keeps ping`, and with `--loop 4` the check is proved. A result with no `num_bounded_loops`, or one that is not a count, is incomplete too. `ausweg bench` prints `incomplete`, and mutation scoring counts an incomplete check as unknown, like a timeout.
 
 The invariant: alice, bob and carol, plus any address the constructor takes (a fee treasury), hold every share and every asset token, the vault holding its own assets; the asset's supply is at most 2^96; and the share price is at least 1, `totalAssets() >= totalSupply()`. `--no-price` leaves the last part out: on Solmate the exit check then fails, because a share worth less than one asset unit redeems to 0 and Solmate's `redeem` reverts with `ZERO_ASSETS`.
 
-`--bound-amounts` limits every amount argument to 2^128. No balance can exceed the 2^96 supply cap, so larger amounts can only revert; leaving them out keeps the solver away from OpenZeppelin's and Solady's 512-bit `mulDiv` branch, where a product needs more than 256 bits. On the bench, OZVault's `keeps mint` times out without it and is proved with it.
+`--bound-amounts` limits every amount argument to 2^128. No balance can exceed the 2^96 supply cap, so larger amounts can only revert, except in `approve`; there the bound narrows only `keeps approve`, since storage is symbolic and every other check starts from any allowance. Leaving them out keeps the solver away from OpenZeppelin's and Solady's 512-bit `mulDiv` branch, where a product needs more than 256 bits. On the bench, OZVault's `keeps mint` times out without it and is proved with it.
 
 A constructor address that is not the asset (OZFeeVault's treasury) gets a fixed address in the proof. Halmos models `makeAddr` as an unknown function, so with it the solver can make the treasury equal to a user, and the fee then lands in the user's own balance.
 
@@ -212,7 +231,7 @@ A vault with `requestRedeem`, `pendingRedeemRequest` and `claimableRedeemRequest
 | `fair <f>` | Called by alice or by the owner, `<f>` does not lower the share price. Checked from any state with the shares accounted for. |
 | `init`, `keeps <f>` | The invariant, as in Step 13, plus the vault's accounting for requests; callers include the owner. |
 
-All proved means: from every reachable state, every user can get out in three steps, if the owner eventually fulfils requests (or as time passes), and no other user, nor the owner, can shrink a request or lower the share price on the way. Requests are read at id 0, one per controller, as in ERC-7540's controller-only requests, and fulfilled with `fulfillRedeem(address controller, uint256 shares)`. Since 0.6.6 a vault that gives its requests other ids, or fulfils them with another function, is refused with a message saying so; before, it failed the probe as if its requests never became claimable. Since 0.6.5 the three exit steps are checked for each of alice, bob and carol. The stable and fair checks still protect bob against alice and the owner: that covers every pair of users because they are interchangeable, which holds unless the vault's code singles out an address, since all of its storage is symbolic. They also assume no delegation: the other caller has no allowance or operator rights over bob's shares, because a user who delegates lets the delegate act for them. The owner is the test contract that deployed the vault; changes of owner (`transferOwnership`) and calls that need a signature (`permit`, `authorizeOperator`) are left out.
+All proved means: by induction, every reachable state satisfies the invariant, and from each one every user can request all their shares; the owner can make a whole request claimable (or, with a delay, it becomes claimable once the delay is over); every user can claim everything claimable; and no call by another user or the owner shrinks a request or lowers the share price. Each step is checked on its own. That they add up to one exit, if the owner fulfils or the delay passes, is argued from them, not checked; since 0.7.0 the report's `stages:` line says so, and its `requests:` and `interference:` lines state the request scope and the no-delegation assumption below. The verdict also needs every obligation with a result, no check incomplete, and every state-changing entry point checked, as for ERC-4626. Requests are read at id 0, one per controller, as in ERC-7540's controller-only requests, and fulfilled with `fulfillRedeem(address controller, uint256 shares)`. Since 0.6.6 a vault that gives its requests other ids, or fulfils them with another function, is refused with a message saying so; before, it failed the probe as if its requests never became claimable. Since 0.6.5 the three exit steps are checked for each of alice, bob and carol. The stable and fair checks still protect bob against alice and the owner: that covers every pair of users because they are interchangeable, which holds unless the vault's code singles out an address, since all of its storage is symbolic. They also assume no delegation: the other caller has no allowance or operator rights over bob's shares, because a user who delegates lets the delegate act for them. The owner is the test contract that deployed the vault; changes of owner (`transferOwnership`) and calls that need a signature (`permit`, `authorizeOperator`) are left out.
 
 Vaults keep a request's shares and assets in different places. Before writing the invariant, ausweg runs one request through the vault in a forge test, `test/generated/<Name>.style.t.sol`: a deposit, a request of 400 of 1000 shares, then the fulfilment or ten years. Which of its tests pass tells ausweg whether the vault burns the shares, and sets the assets aside, at the request or at the fulfilment. The invariant then says the vault holds exactly the shares, and sets aside exactly the assets, of the requests it keeps. The report's `exit:` line says what the probe saw.
 
@@ -220,7 +239,7 @@ The probe also reads two things the views may not show (Step 16). First, the vau
 
 Two rules for reading a check, in both proofs since 0.6.0. Halmos drops a path that reverts, so a call that left a view reverting (`totalAssets()` underflowing, say) would go unnoticed: the `keeps` checks read the invariant through an external call and count a revert as breaking it. And each check makes its call in a `try`, checking only a call that succeeds: a call that reverts changes nothing. A check is then vacuous only when its assumptions leave no state at all. On a vault with synchronous deposits, `requestDeposit` always reverts, and its checks prove.
 
-From a run on ausweg-oz-bench, OpenZeppelin's ERC-7540 (Community Contracts' `ERC7540SyncDeposit` and `ERC7540AdminRedeem`, unchanged, under a wrapper that adds an owner and fulfils at the vault's own price), with `--bound-amounts --no-mutation`:
+From a 0.7.0 run on ausweg-oz-bench, OpenZeppelin's ERC-7540 (Community Contracts' `ERC7540SyncDeposit` and `ERC7540AdminRedeem`, unchanged, under a wrapper that adds an owner and fulfils at the vault's own price), with `--bound-amounts --no-mutation`:
 
 ```
 ## src/OZAdminVault.sol (prove)
@@ -228,16 +247,23 @@ From a run on ausweg-oz-bench, OpenZeppelin's ERC-7540 (Community Contracts' `ER
 - exit: request, then the owner fulfils, then claim; requested shares burned at the request; their assets set aside at the fulfilment
 - totals: _totalPendingDepositAssets = stays 0; _totalPendingRedeemShares = shares of pending and claimable requests; _totalClaimableAssets = assets owed to claimable requests; _totalClaimableShares = shares of claimable requests
 - price: (totalAssets + 1) / (shares + 1)
-- checks: 48 -> 48 proved, 0 counterexample, 0 timeout, 0 vacuous, 0 error -> test/generated/OZAdminVault.proof.t.sol
-  - proved: claim redeem (2.0s, 58 paths)
+- model: alice, bob, carol and the owner (the deploying contract) call every state-changing vault function with any arguments, amounts up to 2^128; the vault is deployed with a fresh plain ERC-20 asset, then its storage and the asset's are made symbolic; the asset moves only by transfer, approval and minting, up to 2^96 in all
+- requests: read at id 0, one per controller; the owner fulfils them with fulfillRedeem(controller, shares)
+- interference: the stable and fair checks protect bob from alice and the owner, assuming neither has an allowance or operator rights over bob's shares; the fair checks start from any state with the shares accounted for
+- checks: 48 -> 48 proved, 0 counterexample, 0 timeout, 0 vacuous, 0 incomplete, 0 error -> test/generated/OZAdminVault.proof.t.sol
+  - proved: claim redeem (6.9s, 174 paths)
   - ...
-  - proved: fair deposit (53.2s, 1205 paths)
+  - proved: fair deposit (78.6s, 1204 paths)
   - ...
-  - proved: keeps withdraw (173.9s, 2779 paths)
+  - proved: keeps withdraw (1883.1s, 2779 paths)
   - ...
-- liquidity: proved: from every reachable state of the three-user world, every user can get out in three steps, if the owner fulfils requests eventually; no other user, and not the owner, can shrink a request or lower the share price
-- time: 1376s
+- keeps checks for: approve, asset.approve, asset.mint, asset.transfer, asset.transferFrom, deposit, deposit_2, fulfillRedeem, mint, mint_2, redeem, requestDeposit, requestRedeem, setOperator, transfer, transferFrom, withdraw
+- left out by the model: renounceOwnership (changes the owner), transferOwnership (changes the owner)
+- stages: proved, each on its own, for every user from every state that satisfies the invariant: a user can request all their shares; the owner can make a whole pending request claimable; a user can claim everything claimable; and no call by alice or the owner shrinks bob's request or lowers the share price. That the stages compose into one exit is argued, not checked: it needs the owner to fulfil
+- time: 4059s
 ```
+
+That run shared two cores with other proofs. Its `keeps withdraw` explored the same 2779 paths as under 0.6.0, and took 259 s when run alone.
 
 ### `ausweg bench`
 
@@ -248,9 +274,9 @@ ausweg bench --contract src/SolmateVault.sol
 ausweg bench --suite test/SolmateVault.a16zb.t.sol:SolmateVaultA16zBounded --loop 4 --checks test_RT
 ```
 
-`--contract` benchmarks a vault's liquidity proof: the two exit checks, or every check with `--checks check_`. `--suite <file>:<contract>` benchmarks Halmos tests already in the project, such as [a16z's ERC-4626 suite](https://github.com/a16z/erc4626-tests). `--solvers` (default `yices,bitwuzla,ausweg`) takes `ausweg` or any name `halmos --solver` accepts. `--solver-timeout` (default 60 s) applies to every query, for every solver; `--cap` (default 600 s) stops a check still running. Each cell reads `proved`, `counterexample`, `timeout` (a query ran out of time, so Halmos could not decide), `error` (Halmos logged a solver error, or stopped on something it does not support, such as a missing cheat code), or `unfinished` (stopped at the cap). Stopping a check also stops every solver it started, so one cell never slows down the next.
+`--contract` benchmarks a vault's liquidity proof: the exit checks (three since 0.7.0), or every check with `--checks check_`. `--suite <file>:<contract>` benchmarks Halmos tests already in the project, such as [a16z's ERC-4626 suite](https://github.com/a16z/erc4626-tests). `--solvers` (default `yices,bitwuzla,ausweg`) takes `ausweg` or any name `halmos --solver` accepts. `--solver-timeout` (default 60 s) applies to every query, for every solver; `--cap` (default 600 s) stops a check still running. Each cell reads `proved`, `counterexample`, `timeout` (a query ran out of time, so Halmos could not decide), `incomplete` (passed with paths cut at the loop bound), `error` (Halmos logged a solver error, or stopped on something it does not support, such as a missing cheat code), or `unfinished` (stopped at the cap). Stopping a check also stops every solver it started, so one cell never slows down the next.
 
-From a run on the ausweg-bench SolmateVault with `--cap 300`:
+From a run on the ausweg-bench SolmateVault with `--cap 300`, before 0.7.0 added `exit max_redeem`:
 
 ```
 ## src/SolmateVault.sol (bench: 60 s per query, 300 s per check)
@@ -301,7 +327,7 @@ Large contracts: Ollama drops the start of a prompt longer than its context wind
 3. Run `halmos --solver-command "ausweg smt"` with dynamic test linking off (Halmos cannot follow `vm.deployCode`).
 4. Read Halmos's JSON results; then, unless `--no-mutation`, rerun on every mutant.
 
-`ausweg smt <query.smt2>` is the solver Halmos calls. Bit-blasting solvers time out on a vault's 256-bit `mulDiv` arithmetic, even with small numbers. `ausweg smt` writes each n-bit value as an integer in [0, 2^n) and keeps each operation's modular meaning; where the bounds asserted in the query show a sum or product cannot wrap, it drops the `mod`. Halmos writes `a - b` as `a + (2^256 - 1) * b`; since 0.6.0 such a sum becomes a plain difference when the query shows it cannot wrap: solc's checked subtraction asserts `a - b <= a`, and a solvency check asserts that one sum is at most another. z3 solves the result, in three stages within the time limit: its general solver for 2 s, then its `qfnia` tactic for half of what is left, then the general solver again. Each stage answers queries the other stalls on; since 0.5.0 this settles queries that timed out before, such as the fee vault's `exit redeem`. Operations with no simple integer form, such as a bitwise and of two unknown words, become uninterpreted functions: an `unsat` answer still holds, and a `sat` answer goes to a bit-vector solver (yices or bitwuzla) for a real model. Since 0.6.3, a query with assertion scopes (`push`, `pop`) or more than one `check-sat` is not translated: it goes to the bit-vector solver unchanged, yices in incremental mode. Before, ausweg read past `push` and `pop`, kept the popped assertion, and could answer `unsat` for a satisfiable query, which would count as a proof. None of the Halmos queries saved during development has either. `AUSWEG_SMT_SOLVER` and `AUSWEG_SMT_FALLBACK` override the solvers; the integer query is kept next to Halmos's as `<n>.int.smt2`.
+`ausweg smt <query.smt2>` is the solver Halmos calls. Bit-blasting solvers time out on a vault's 256-bit `mulDiv` arithmetic, even with small numbers. `ausweg smt` writes each n-bit value as an integer in [0, 2^n) and keeps each operation's modular meaning; where the bounds asserted in the query show a sum or product cannot wrap, it drops the `mod`. Halmos writes `a - b` as `a + (2^256 - 1) * b`; since 0.6.0 such a sum becomes a plain difference when the query shows it cannot wrap: solc's checked subtraction asserts `a - b <= a`, and a solvency check asserts that one sum is at most another. z3 solves the result, in three stages within the time limit: its general solver for 2 s, then its `qfnia` tactic for half of what is left, then the general solver again. Each stage answers queries the other stalls on; since 0.5.0 this settles queries that timed out before, such as the fee vault's `exit redeem`. Operations with no simple integer form, such as a bitwise and of two unknown words, become uninterpreted functions: an `unsat` answer still holds, and a `sat` answer goes to a bit-vector solver (yices or bitwuzla) for a real model; with neither installed, the answer is `unknown`, which Halmos does not count as a pass. Since 0.7.0 yices runs with `--smt2-model-format --bvconst-in-decimal`, as when Halmos calls it itself. Without them yices prints its model as `(= p_a #b…)`, which Halmos does not read, so a counterexample found this way came back with no values. Since 0.6.3, a query with assertion scopes (`push`, `pop`) or more than one `check-sat` is not translated: it goes to the bit-vector solver unchanged, yices in incremental mode. Before, ausweg read past `push` and `pop`, kept the popped assertion, and could answer `unsat` for a satisfiable query, which would count as a proof. None of the Halmos queries saved during development has either. `AUSWEG_SMT_SOLVER` and `AUSWEG_SMT_FALLBACK` override the solvers; the integer query is kept next to Halmos's as `<n>.int.smt2`.
 
 For an ERC-4626 vault, ausweg also writes two exit checks of its own, `invariant_ausweg_exit_redeem` and `invariant_ausweg_exit_withdraw`. From every state the fuzzer reaches, alice, bob and carol each redeem every share they hold, one after another, as in a bank run; in the second check, each withdraws what `maxWithdraw` quotes. A reverted exit, shares left after a full redeem, a payout below `previewRedeem`, more shares burned than `previewWithdraw`, or a transfer that differs from the reported amount fails the check. Each check runs in a snapshot that is rolled back, so the campaign continues from the state it reached. They need no model; `--no-exit-checks` leaves them out, as in 0.2.3.
 

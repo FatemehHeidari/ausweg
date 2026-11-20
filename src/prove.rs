@@ -42,6 +42,9 @@ pub struct ProveOptions {
     pub bound_amounts: bool,
     pub mutation: bool,
     pub max_mutants: usize,
+    /// `halmos --loop`: how far loops are unrolled. A check whose loops hit
+    /// the bound is reported as bounded, not proved.
+    pub loop_bound: Option<u32>,
 }
 
 #[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +55,10 @@ pub enum Verdict {
     Timeout,
     /// Every path was cut by an assumption or reverted: nothing was checked.
     Vacuous,
+    /// Halmos passed the check without saying it explored every path: it cut
+    /// paths at the loop unrolling bound (`--loop`), or its result leaves the
+    /// count of such cuts out. Not a proof.
+    Incomplete,
     Error,
 }
 
@@ -64,6 +71,25 @@ pub struct Check {
     /// Named values of the first counterexample, e.g. ("i", "bob").
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub counterexample: Vec<(String, String)>,
+    /// Why an `incomplete` check is not a proof.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incomplete: Option<String>,
+    /// For a counterexample: where its state starts. Only `check_init`
+    /// starts at deployment; every other witness is a state the solver chose
+    /// within the check's starting constraint, not shown reachable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub witness: Option<String>,
+}
+
+/// Where a counterexample to `name` starts, for ausweg's own proofs.
+pub(crate) fn witness_start(name: &str, async_vault: bool) -> String {
+    if name == "check_init" {
+        "deployment".to_string()
+    } else if async_vault && name.starts_with("check_fair_") {
+        "a state with the shares accounted for; not shown reachable from deployment".to_string()
+    } else {
+        "a state that satisfies the invariant; not shown reachable from deployment".to_string()
+    }
 }
 
 #[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
@@ -119,9 +145,18 @@ pub struct ProveReport {
     /// withholds liquidity_proved.
     pub unchecked: Vec<Unchecked>,
     pub checks: Vec<Check>,
-    /// Every check proved, and every state-changing entry point checked: exit
-    /// holds in every reachable state of the world.
+    /// ERC-4626: each exit property on its own (full redemption, redemption at
+    /// maxRedeem, withdrawal at maxWithdraw).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub properties: Vec<Property>,
+    /// The verdict. ERC-4626: full exit, that is init, every keeps check and
+    /// full redemption proved, with every state-changing entry point checked.
+    /// ERC-7540: every check proved, with the same coverage.
     pub liquidity_proved: bool,
+    /// Why liquidity_proved is false: checks not proved, obligations with no
+    /// result, entry points with no keeps check.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub withheld: Vec<String>,
     pub seconds: f64,
     pub mutation: Option<ProofMutation>,
 }
@@ -458,6 +493,7 @@ pub fn render(
         "check_keeps_asset_approve",
         "check_keeps_asset_mint",
         "check_exit_redeem",
+        "check_exit_max_redeem",
         "check_exit_withdraw",
     ] {
         checks.push(n.to_string());
@@ -490,9 +526,11 @@ pragma solidity ^0.8.0;
 //
 // check_init: a fresh deployment satisfies the invariant.
 // check_keeps_*: every state-changing call keeps it, for any caller and arguments.
-// check_exit_redeem: from any state that satisfies it, each user redeems every
-// share they hold. check_exit_withdraw: each user withdraws what maxWithdraw
-// quotes. A preview or max view that reverts fails the check.
+// check_exit_redeem: from any state that satisfies it, each user with shares
+// redeems all of them in one call. check_exit_max_redeem and
+// check_exit_withdraw: each user redeems what maxRedeem quotes, and withdraws
+// what maxWithdraw quotes, when the quote is positive. A preview or max view
+// that reverts fails the check.
 
 import {{Test}} from "forge-std/Test.sol";
 import "{import_path}";
@@ -626,6 +664,40 @@ contract {c}Proof is Test {{
         }}
     }}
 
+    /// From any state that satisfies the invariant, user i redeems what
+    /// maxRedeem quotes, when the quote is positive: the advertised limit is
+    /// honored. It may be less than the balance; a quote of 0 promises nothing.
+    function check_exit_max_redeem(uint256 i) public {{
+        vm.assume(i < 3);
+        address u = _user(i);
+        vm.assume(_inv());
+        _witness();
+        uint256 held = target.balanceOf(u);
+        vm.assume(held == svm.createUint256("userShares"));
+        uint256 shares;
+        try target.maxRedeem(u) returns (uint256 m) {{
+            shares = m;
+        }} catch {{
+            assert(false);
+        }}
+        vm.assume(shares > 0);
+        uint256 promised;
+        try target.previewRedeem(shares) returns (uint256 p) {{
+            promised = p;
+        }} catch {{
+            assert(false);
+        }}
+        uint256 before = asset.balanceOf(u);
+        vm.prank(u);
+        try target.redeem(shares, u, u) returns (uint256 paid) {{
+            assert(paid >= promised);
+            assert(asset.balanceOf(u) == before + paid);
+            assert(target.balanceOf(u) + shares == held);
+        }} catch {{
+            assert(false);
+        }}
+    }}
+
     /// From any state that satisfies the invariant, user i withdraws what
     /// maxWithdraw quotes.
     function check_exit_withdraw(uint256 i) public {{
@@ -692,16 +764,99 @@ contract {c}Proof is Test {{
     })
 }
 
-/// Liquidity is proved when Halmos proved every check the proof wrote, and the
-/// proof wrote a full keeps check for every state-changing entry point.
-pub(crate) fn liquidity(checks: &[Check], proof: &Proof) -> bool {
-    !checks.is_empty()
-        && checks.iter().all(|c| c.verdict == Verdict::Proved)
-        && proof
-            .checks
-            .iter()
-            .all(|n| checks.iter().any(|c| &c.name == n))
-        && proof.unchecked.is_empty()
+/// The ERC-4626 exit properties: each has its own check and is reported on its
+/// own. The full-exit verdict rests on the first.
+pub const EXIT_PROPERTIES: [(&str, &str); 3] = [
+    (
+        "check_exit_redeem",
+        "full redemption (the whole balance, in one call)",
+    ),
+    (
+        "check_exit_max_redeem",
+        "redemption at a positive maxRedeem quote",
+    ),
+    (
+        "check_exit_withdraw",
+        "withdrawal at a positive maxWithdraw quote",
+    ),
+];
+
+/// Why a verdict is withheld; empty when it holds. The verdict needs every
+/// check `part` picks out to be proved, every obligation the proof wrote to
+/// have a result, and a keeps check for every state-changing entry point.
+pub(crate) fn withheld(
+    checks: &[Check],
+    proof: &Proof,
+    part: &dyn Fn(&str) -> bool,
+) -> Vec<String> {
+    let mut why = Vec::new();
+    if checks.is_empty() {
+        why.push("Halmos reported no checks".to_string());
+    }
+    for n in proof.checks.iter().filter(|n| part(n)) {
+        match checks.iter().find(|c| &c.name == n) {
+            None => why.push(format!("{}: no result", label(n))),
+            Some(c) if c.verdict != Verdict::Proved => why.push(format!(
+                "{}: {}",
+                label(n),
+                match c.verdict {
+                    Verdict::Counterexample => "counterexample".to_string(),
+                    Verdict::Timeout => "timeout".to_string(),
+                    Verdict::Vacuous => "vacuous".to_string(),
+                    Verdict::Incomplete => format!(
+                        "incomplete ({})",
+                        c.incomplete.as_deref().unwrap_or("not every path explored")
+                    ),
+                    Verdict::Error => "error".to_string(),
+                    Verdict::Proved => unreachable!(),
+                }
+            )),
+            Some(_) => {}
+        }
+    }
+    for u in &proof.unchecked {
+        why.push(format!("{}: no keeps check", u.function));
+    }
+    why
+}
+
+/// The checks every ERC-4626 verdict rests on: the induction (init and keeps),
+/// not the exit properties.
+fn induction(name: &str) -> bool {
+    !EXIT_PROPERTIES.iter().any(|(c, _)| *c == name)
+}
+
+/// Each ERC-4626 exit property, and why the main verdict is withheld (empty
+/// when it holds). For ERC-4626 that is the full-exit verdict: the induction
+/// and full redemption. For ERC-7540 it rests on every check.
+pub(crate) fn verdicts(checks: &[Check], proof: &Proof) -> (Vec<Property>, Vec<String>) {
+    if proof.exit.is_some() {
+        return (Vec::new(), withheld(checks, proof, &|_| true));
+    }
+    let properties = EXIT_PROPERTIES
+        .iter()
+        .map(|(check, property)| Property {
+            property: property.to_string(),
+            check: check.to_string(),
+            verdict: checks.iter().find(|c| c.name == *check).map(|c| c.verdict),
+            proved: withheld(checks, proof, &|n| induction(n) || n == *check).is_empty(),
+        })
+        .collect();
+    let full = withheld(checks, proof, &|n| {
+        induction(n) || n == EXIT_PROPERTIES[0].0
+    });
+    (properties, full)
+}
+
+/// One ERC-4626 exit property: its own check's verdict, and whether it is
+/// proved, that is its check proved and the induction and coverage hold.
+#[derive(Debug, Serialize, Clone)]
+pub struct Property {
+    pub property: String,
+    pub check: String,
+    /// The property's own check; None if Halmos gave it no result.
+    pub verdict: Option<Verdict>,
+    pub proved: bool,
 }
 
 // ---------------------------------------------------------------- running
@@ -734,6 +889,9 @@ fn run_halmos(
         .current_dir(repo);
     if early_exit {
         cmd.arg("--early-exit");
+    }
+    if let Some(n) = opts.loop_bound {
+        cmd.args(["--loop", &n.to_string()]);
     }
     // Halmos calls `forge` itself: make the one ausweg was given come first.
     let forge = Path::new(&opts.forge_bin);
@@ -774,6 +932,8 @@ fn run_halmos(
                 seconds: 0.0,
                 paths: 0,
                 counterexample: Vec::new(),
+                incomplete: None,
+                witness: None,
             };
             return Ok((Some(vec![check]), log));
         }
@@ -874,7 +1034,23 @@ pub fn parse_results(text: &str, proof_contract: &str) -> Result<Option<Vec<Chec
     for r in list {
         let full = r.get("name").and_then(|n| n.as_str()).unwrap_or("");
         let name = full.split('(').next().unwrap_or(full).to_string();
+        // Halmos 0.3 passes a check even when it cut paths at the loop
+        // unrolling bound, and counts the cuts only in `num_bounded_loops`. A
+        // pass is a proof only when that count is there and is 0.
+        let bounded = r.get("num_bounded_loops").map(|n| n.as_u64());
+        let incomplete = match bounded {
+            Some(Some(0)) => None,
+            Some(Some(k)) => Some(format!(
+                "Halmos's loop bound cut {k} path{} short; rerun with a higher --loop",
+                if k == 1 { "" } else { "s" }
+            )),
+            Some(None) => Some("Halmos's num_bounded_loops is not a count".to_string()),
+            None => {
+                Some("Halmos's result does not say whether its loop bound cut any path".to_string())
+            }
+        };
         let verdict = match r.get("exitcode").and_then(|e| e.as_i64()) {
+            Some(0) if incomplete.is_some() => Verdict::Incomplete,
             Some(0) => Verdict::Proved,
             Some(1) => Verdict::Counterexample,
             Some(2) => Verdict::Timeout,
@@ -919,12 +1095,15 @@ pub fn parse_results(text: &str, proof_contract: &str) -> Result<Option<Vec<Chec
             vars.sort();
             counterexample = vars;
         }
+        let incomplete = incomplete.filter(|_| verdict == Verdict::Incomplete);
         checks.push(Check {
             name,
             verdict,
             seconds,
             paths,
             counterexample,
+            incomplete,
+            witness: None,
         });
     }
     Ok(Some(checks))
@@ -1116,10 +1295,17 @@ pub fn run(
     } = prepare(repo, contract, forge, opts.price, opts.bound_amounts)?;
 
     let (checks, log) = run_halmos(repo, &proof_contract, opts, false)?;
-    let Some(checks) = checks else {
+    let Some(mut checks) = checks else {
         bail!("Halmos did not run the proof:\n{}", log_tail(&log));
     };
-    let liquidity_proved = liquidity(&checks, &proof);
+    for c in checks
+        .iter_mut()
+        .filter(|c| c.verdict == Verdict::Counterexample)
+    {
+        c.witness = Some(witness_start(&c.name, proof.exit.is_some()));
+    }
+    let (properties, withheld_why) = verdicts(&checks, &proof);
+    let liquidity_proved = withheld_why.is_empty();
 
     let mut report = ProveReport {
         contract: contract.display().to_string(),
@@ -1131,7 +1317,9 @@ pub fn run(
         left_out: proof.left_out,
         unchecked: proof.unchecked,
         checks,
+        properties,
         liquidity_proved,
+        withheld: withheld_why,
         seconds: 0.0,
         mutation: None,
     };
@@ -1181,7 +1369,7 @@ fn score(
                         .collect()
                 };
                 let caught = pick(&[Verdict::Counterexample]);
-                let timed = pick(&[Verdict::Timeout, Verdict::Error]);
+                let timed = pick(&[Verdict::Timeout, Verdict::Error, Verdict::Incomplete]);
                 let outcome = if !caught.is_empty() {
                     ProofOutcome::Caught
                 } else if !timed.is_empty() {
@@ -1293,6 +1481,7 @@ impl BenchCell {
             Some(Verdict::Counterexample) => format!("counterexample {:.0}s", self.seconds),
             Some(Verdict::Timeout) => format!("timeout {:.0}s", self.seconds),
             Some(Verdict::Vacuous) => format!("vacuous {:.0}s", self.seconds),
+            Some(Verdict::Incomplete) => format!("incomplete {:.0}s", self.seconds),
             Some(Verdict::Error) => format!("error {:.0}s", self.seconds),
             None => format!("unfinished at {:.0}s", self.seconds),
         }
@@ -1586,11 +1775,88 @@ mod tests {
                 seconds: 0.0,
                 paths: 1,
                 counterexample: vec![],
+                incomplete: None,
+                witness: None,
             })
             .collect();
-        assert!(!liquidity(&all_proved, &p));
+        let (props, why) = verdicts(&all_proved, &p);
+        assert_eq!(
+            why,
+            vec![
+                "batch(uint256[]): no keeps check",
+                "sweep(address[]): no keeps check"
+            ]
+        );
+        // Each property's own check proved, yet none is proved: the induction
+        // misses two transitions.
+        assert!(
+            props
+                .iter()
+                .all(|q| q.verdict == Some(Verdict::Proved) && !q.proved)
+        );
         p.unchecked.clear();
-        assert!(liquidity(&all_proved, &p));
+        let (props, why) = verdicts(&all_proved, &p);
+        assert!(why.is_empty());
+        assert!(props.iter().all(|q| q.proved));
+    }
+
+    /// Every check of `p` proved, except those named, with these verdicts.
+    fn results(p: &Proof, except: &[(&str, Verdict)]) -> Vec<Check> {
+        p.checks
+            .iter()
+            .filter_map(|n| {
+                let verdict = match except.iter().find(|(m, _)| m == n) {
+                    Some((_, v)) if *v == Verdict::Error => return None,
+                    Some((_, v)) => *v,
+                    None => Verdict::Proved,
+                };
+                Some(Check {
+                    name: n.clone(),
+                    verdict,
+                    seconds: 0.0,
+                    paths: 1,
+                    counterexample: vec![],
+                    incomplete: (verdict == Verdict::Incomplete)
+                        .then(|| "Halmos's loop bound cut 1 path short".to_string()),
+                    witness: None,
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn each_exit_property_stands_alone_and_the_verdict_fails_closed() {
+        let abi = Abi::parse(OZ_VAULT_ABI).unwrap();
+        let mut p = render("OZVault", "../../src/OZVault.sol", &abi, true, false).unwrap();
+        p.unchecked.clear(); // the fixture's batch(uint256[]), covered elsewhere
+        // A vault with a valid partial limit: the whole balance cannot go in one
+        // call, but both advertised quotes are honored.
+        let partial = results(&p, &[("check_exit_redeem", Verdict::Counterexample)]);
+        let (props, why) = verdicts(&partial, &p);
+        let got: Vec<(&str, bool)> = props.iter().map(|q| (q.check.as_str(), q.proved)).collect();
+        assert_eq!(
+            got,
+            vec![
+                ("check_exit_redeem", false),
+                ("check_exit_max_redeem", true),
+                ("check_exit_withdraw", true)
+            ]
+        );
+        assert_eq!(why, vec!["exit redeem: counterexample"]);
+        // A broken withdraw quote leaves the full-exit verdict standing.
+        let quote = results(&p, &[("check_exit_withdraw", Verdict::Counterexample)]);
+        assert!(verdicts(&quote, &p).1.is_empty());
+        // A keeps check cut short by a loop bound withholds everything.
+        let cut = results(&p, &[("check_keeps_deposit", Verdict::Incomplete)]);
+        let (props, why) = verdicts(&cut, &p);
+        assert_eq!(
+            why,
+            vec!["keeps deposit: incomplete (Halmos's loop bound cut 1 path short)"]
+        );
+        assert!(props.iter().all(|q| !q.proved));
+        // So does an obligation Halmos gave no result for (Error here drops it).
+        let missing = results(&p, &[("check_keeps_redeem", Verdict::Error)]);
+        assert_eq!(verdicts(&missing, &p).1, vec!["keeps redeem: no result"]);
     }
 
     #[test]
@@ -1598,9 +1864,23 @@ mod tests {
         let abi = Abi::parse(OZ_VAULT_ABI).unwrap();
         let p = render("OZVault", "../../src/OZVault.sol", &abi, true, false).unwrap();
         // Every share the user holds, not what maxRedeem quotes, and none left.
-        assert!(p.source.contains("uint256 shares = target.balanceOf(u);"));
-        assert!(!p.source.contains("target.maxRedeem(u)"));
-        assert!(p.source.contains("assert(target.balanceOf(u) == 0);"));
+        let body = |f: &str| {
+            let start = p.source.find(&format!("function {f}(")).unwrap();
+            let end = p.source[start..].find("\n    }\n").unwrap();
+            p.source[start..start + end].to_string()
+        };
+        let full = body("check_exit_redeem");
+        assert!(full.contains("uint256 shares = target.balanceOf(u);"));
+        assert!(!full.contains("maxRedeem"));
+        assert!(full.contains("assert(target.balanceOf(u) == 0);"));
+        // A positive preview is not required: a balance whose value rounds to
+        // 0 must still redeem and clear.
+        assert!(!full.contains("promised > 0"));
+        // The advertised limit has a check of its own: a positive quote, honored.
+        let limit = body("check_exit_max_redeem");
+        assert!(limit.contains("try target.maxRedeem(u) returns (uint256 m) {"));
+        assert!(limit.contains("vm.assume(shares > 0);"));
+        assert!(limit.contains("assert(target.balanceOf(u) + shares == held);"));
         // A view that reverts fails the check instead of dropping the state.
         for view in [
             "try target.previewRedeem(shares) returns (uint256 p) {",
@@ -1637,9 +1917,60 @@ mod tests {
         assert_eq!(checks[2].verdict, Verdict::Timeout);
         assert_eq!(label("check_keeps_mint"), "keeps mint");
         assert!(parse_results(json, "Other").unwrap().is_none());
-        let twins = r#"{"test_results":{"test/Old.t.sol:VProof":[{"name":"check_init()","exitcode":1}],"test/generated/V.proof.t.sol:VProof":[{"name":"check_init()","exitcode":0}]}}"#;
+        let twins = r#"{"test_results":{"test/Old.t.sol:VProof":[{"name":"check_init()","exitcode":1}],"test/generated/V.proof.t.sol:VProof":[{"name":"check_init()","exitcode":0,"num_bounded_loops":0}]}}"#;
         let checks = parse_results(twins, "VProof").unwrap().unwrap();
         assert_eq!(checks[0].verdict, Verdict::Proved);
+    }
+
+    #[test]
+    fn says_where_each_witness_starts() {
+        assert_eq!(witness_start("check_init", false), "deployment");
+        assert!(
+            witness_start("check_exit_redeem", false)
+                .starts_with("a state that satisfies the invariant")
+        );
+        assert!(
+            witness_start("check_fair_redeem", true)
+                .starts_with("a state with the shares accounted for")
+        );
+        assert!(witness_start("check_fair_redeem", false).contains("not shown reachable"));
+    }
+
+    #[test]
+    fn a_pass_that_cut_loops_or_does_not_say_is_incomplete() {
+        // What Halmos 0.3.3 writes for a check whose loop hit the bound: a pass.
+        let json = r#"{"test_results": {"test/generated/V.proof.t.sol:VProof": [
+            {"name": "check_keeps_spread(uint256,uint256)", "exitcode": 0, "num_models": 0,
+             "models": [], "num_paths": [7, 7, 0], "time": [1.0, 1.0, 0.0], "num_bounded_loops": 1},
+            {"name": "check_init()", "exitcode": 0, "num_paths": [1, 1, 0]},
+            {"name": "check_exit_redeem(uint256)", "exitcode": 0, "num_bounded_loops": "two"},
+            {"name": "check_keeps_mint(uint256,uint256,uint256)", "exitcode": 0, "num_bounded_loops": 0},
+            {"name": "check_keeps_burn(uint256,uint256)", "exitcode": 1, "num_bounded_loops": 3}]}}"#;
+        let checks = parse_results(json, "VProof").unwrap().unwrap();
+        let got: Vec<(Verdict, Option<&str>)> = checks
+            .iter()
+            .map(|c| (c.verdict, c.incomplete.as_deref()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (
+                    Verdict::Incomplete,
+                    Some("Halmos's loop bound cut 1 path short; rerun with a higher --loop")
+                ),
+                (
+                    Verdict::Incomplete,
+                    Some("Halmos's result does not say whether its loop bound cut any path")
+                ),
+                (
+                    Verdict::Incomplete,
+                    Some("Halmos's num_bounded_loops is not a count")
+                ),
+                (Verdict::Proved, None),
+                // A counterexample found on the paths explored is still one.
+                (Verdict::Counterexample, None),
+            ]
+        );
     }
 
     #[test]
