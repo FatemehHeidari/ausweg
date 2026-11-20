@@ -190,6 +190,22 @@ pub struct Learned {
     /// leaves them out.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unread: Vec<String>,
+    /// Totals that stayed 0 through the walk but are not named for requests,
+    /// like a `totalFees` the walk never touches: pinning one to 0 would make a
+    /// keeps check fail as soon as a call raises it, so the invariant leaves
+    /// them out.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub idle: Vec<String>,
+}
+
+/// Whether a total's name says it is about requests, as a deposit-side total
+/// that stays 0 in a vault with synchronous deposits is
+/// (`_totalPendingDepositAssets`).
+fn about_requests(label: &str) -> bool {
+    let l = label.to_ascii_lowercase();
+    ["pending", "claimable", "request", "queue"]
+        .iter()
+        .any(|w| l.contains(w))
 }
 
 fn total_test(slot: &str, c: Counts) -> String {
@@ -209,6 +225,7 @@ pub fn learned_from(passed: &[String], stored: &[Stored]) -> Learned {
             .filter(|c| p(&total_test(&s.slot, *c)))
             .collect();
         match hits.as_slice() {
+            [Counts::Nothing] if !about_requests(&s.label) => l.idle.push(s.label.clone()),
             [c] => l.totals.push(Total {
                 label: s.label.clone(),
                 slot: s.slot.clone(),
@@ -251,10 +268,50 @@ pub fn supports(abi: &Abi) -> Result<()> {
             missing.join(", ")
         );
     }
+    // ERC-7540 leaves the owner's fulfilment to each vault. Without the one
+    // ausweg calls, a vault with another would be taken for one whose
+    // requests mature with time, and the probe would wait ten years for nothing.
+    let fulfils = other_fulfils(abi);
+    if !fulfils.is_empty() {
+        bail!(
+            "the vault fulfils requests with {}, but ausweg calls fulfillRedeem(address controller, \
+             uint256 shares); wrap the vault with that function, calling yours",
+            fulfils.join(", ")
+        );
+    }
     Ok(())
 }
 
+/// State-changing functions named like a fulfilment (`fulfil…`, `fulfill…`)
+/// when the vault has no `fulfillRedeem(address, uint256)`.
+fn other_fulfils(abi: &Abi) -> Vec<String> {
+    if abi.has("fulfillRedeem", &["address", "uint256"]) {
+        return Vec::new();
+    }
+    abi.mutating()
+        .into_iter()
+        .filter(|i| i.name.to_ascii_lowercase().starts_with("fulfil"))
+        .map(crate::prove::short_signature)
+        .collect()
+}
+
+/// Whether `requestRedeem` returns its request id, which the probe then reads.
+fn returns_request_id(abi: &Abi) -> bool {
+    abi.items.iter().any(|i| {
+        i.is_function()
+            && i.name == "requestRedeem"
+            && i.inputs
+                .iter()
+                .map(|p| p.ty.as_str())
+                .eq(["uint256", "address", "address"])
+            && i.outputs.len() == 1
+            && i.outputs[0].ty == "uint256"
+    })
+}
+
 pub const PROBE_RUNS: &str = "test_ausweg_runs";
+/// Passes when the vault gives a request the id 0: ausweg reads requests there.
+pub const PROBE_ID_ZERO: &str = "test_ausweg_request_id_zero";
 const PROBE_BURNS_AT_REQUEST: &str = "test_ausweg_burns_at_request";
 const PROBE_RESERVES_AT_REQUEST: &str = "test_ausweg_reserves_at_request";
 const PROBE_BURNS_AT_FULFIL: &str = "test_ausweg_burns_at_fulfil";
@@ -284,6 +341,9 @@ pub fn probe_source(
         Progress::Time => "        vm.warp(block.timestamp + 3650 days);\n",
     };
     let mut extra = String::new();
+    if returns_request_id(abi) {
+        extra.push_str(&PROBE_ID.replace("@ID@", PROBE_ID_ZERO));
+    }
     if abi.has("convertToShares", &["uint256"]) {
         extra.push_str(
             &PROBE_PRICE
@@ -784,6 +844,16 @@ contract @C@Style is Test {
         assertLt(target.totalAssets(), a);
     }
 @EXTRA@}
+"#;
+
+const PROBE_ID: &str = r#"
+    /// ausweg reads every request at id 0: one request per controller, as in
+    /// ERC-7540's controller-only requests.
+    function @ID@() public {
+        vm.prank(alice);
+        uint256 id = target.requestRedeem(400, alice, alice);
+        assertEq(id, 0);
+    }
 "#;
 
 const PROBE_PRICE: &str = r#"
@@ -1467,6 +1537,31 @@ mod tests {
         // A timed vault's totals are not walked.
         let timed = probe_source("V", "../../src/V.sol", &abi, Progress::Time, &totals).unwrap();
         assert!(!timed.contains("_walk("));
+        // requestRedeem returns its id here, so the probe checks it is 0.
+        assert!(src.contains(&format!("function {PROBE_ID_ZERO}() public {{")));
+        assert!(src.contains("uint256 id = target.requestRedeem(400, alice, alice);"));
+    }
+
+    #[test]
+    fn refuses_a_fulfilment_it_cannot_call() {
+        assert!(supports(&Abi::parse(CONTROLLED).unwrap()).is_ok());
+        // The same vault with the arguments the other way round.
+        let reversed = CONTROLLED.replace(
+            r#""name":"fulfillRedeem","inputs":[{"name":"controller","type":"address"},{"name":"shares","type":"uint256"}]"#,
+            r#""name":"fulfillRedeem","inputs":[{"name":"shares","type":"uint256"},{"name":"controller","type":"address"}]"#,
+        );
+        assert_ne!(reversed, CONTROLLED);
+        let abi = Abi::parse(&reversed).unwrap();
+        // Before: taken for a vault whose requests mature with time.
+        assert_eq!(kind(&abi), Some(Progress::Time));
+        let err = supports(&abi).unwrap_err().to_string();
+        assert!(
+            err.contains("fulfils requests with fulfillRedeem(uint256, address)"),
+            "{err}"
+        );
+        // A vault with no fulfilment at all is a timed vault, as before.
+        let timed = CONTROLLED.replace("\"fulfillRedeem\"", "\"setTimelock\"");
+        assert!(supports(&Abi::parse(&timed).unwrap()).is_ok());
     }
 
     #[test]
@@ -1478,9 +1573,11 @@ mod tests {
             stored("_totalClaimableShares", "10"),
             stored("_totalCached", "12"),
             stored("_totalTwice", "13"),
+            stored("totalFees", "14"),
         ];
         let passed: Vec<String> = [
             "test_ausweg_total_6_nothing",
+            "test_ausweg_total_14_nothing",
             "test_ausweg_total_7_requested",
             "test_ausweg_total_9_owed",
             "test_ausweg_total_10_claimable",
@@ -1508,6 +1605,8 @@ mod tests {
         );
         // Matched nothing, or two records: left out.
         assert_eq!(l.unread, ["_totalCached", "_totalTwice"]);
+        // Stayed 0 but not about requests: left out, not pinned to 0.
+        assert_eq!(l.idle, ["totalFees"]);
         assert_eq!(l.price, PriceRule::Virtual);
         // Both price tests passing (a price of exactly 1) reads as exact.
         let both = [
@@ -1540,6 +1639,7 @@ mod tests {
             ],
             price: PriceRule::Virtual,
             unread: Vec::new(),
+            idle: Vec::new(),
         };
         let p = render(
             "OZAdminVault",

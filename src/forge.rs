@@ -87,6 +87,155 @@ impl Failure {
     pub fn kind(&self) -> FailKind {
         classify(&self.reason)
     }
+
+    /// The kind, knowing the test file's own assertion messages (see
+    /// [`assertion_messages`]): a failure that reads exactly one of them is an
+    /// assertion, such as `assertTrue(x, "supply mismatch")` failing.
+    pub fn kind_with(&self, messages: &[String]) -> FailKind {
+        if messages.iter().any(|m| m == self.reason.trim()) {
+            FailKind::Assertion
+        } else {
+            self.kind()
+        }
+    }
+}
+
+/// The messages a test file's own assertions fail with: the last argument of
+/// each `assert…(…)` or `fail(…)` call, when it is a string literal. A message
+/// the contract also uses as a string, like a revert reason, is left out:
+/// a failure that reads it could be either.
+pub fn assertion_messages(test_src: &str, contract_src: &str) -> Vec<String> {
+    let in_contract: Vec<String> = literals(contract_src);
+    let chars: Vec<char> = test_src.chars().collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if let Some(next) = skip_comment_or_string(&chars, i) {
+            i = next;
+            continue;
+        }
+        let c = chars[i];
+        if c.is_alphabetic() || c == '_' {
+            let start = i;
+            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            let word: String = chars[start..i].iter().collect();
+            let mut j = i;
+            while j < chars.len() && chars[j].is_whitespace() {
+                j += 1;
+            }
+            let called = j < chars.len() && chars[j] == '(';
+            if called
+                && (word.starts_with("assert") || word == "fail")
+                && let Some(m) = last_argument_literal(&chars, j)
+                && !in_contract.contains(&m)
+                && !out.contains(&m)
+            {
+                out.push(m);
+            }
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// If a comment or string literal starts at `i`, the index just past it.
+fn skip_comment_or_string(chars: &[char], i: usize) -> Option<usize> {
+    let at = |k: usize| chars.get(k).copied();
+    match (at(i), at(i + 1)) {
+        (Some('/'), Some('/')) => {
+            let mut k = i;
+            while k < chars.len() && chars[k] != '\n' {
+                k += 1;
+            }
+            Some(k)
+        }
+        (Some('/'), Some('*')) => {
+            let mut k = i + 2;
+            while k + 1 < chars.len() && !(chars[k] == '*' && chars[k + 1] == '/') {
+                k += 1;
+            }
+            Some((k + 2).min(chars.len()))
+        }
+        (Some(q @ ('"' | '\'')), _) => {
+            let mut k = i + 1;
+            while k < chars.len() && chars[k] != q {
+                if chars[k] == '\\' {
+                    k += 1;
+                }
+                k += 1;
+            }
+            Some((k + 1).min(chars.len()))
+        }
+        _ => None,
+    }
+}
+
+/// The text of a string literal, given with its quotes.
+fn unquote(chars: &[char]) -> String {
+    let mut s = String::new();
+    let mut k = 1;
+    while k + 1 < chars.len() {
+        if chars[k] == '\\' && k + 2 < chars.len() {
+            k += 1;
+        }
+        s.push(chars[k]);
+        k += 1;
+    }
+    s
+}
+
+/// The call's last argument, when it is a string literal; `open` is the index
+/// of the call's `(`.
+fn last_argument_literal(chars: &[char], open: usize) -> Option<String> {
+    let mut depth = 0usize;
+    let mut last_start = open + 1;
+    let mut k = open;
+    while k < chars.len() {
+        if let Some(next) = skip_comment_or_string(chars, k) {
+            k = next;
+            continue;
+        }
+        match chars[k] {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    let arg: String = chars[last_start..k].iter().collect();
+                    let arg: Vec<char> = arg.trim().chars().collect();
+                    let quoted = arg.len() >= 2
+                        && matches!(arg[0], '"' | '\'')
+                        && arg[arg.len() - 1] == arg[0]
+                        && skip_comment_or_string(&arg, 0) == Some(arg.len());
+                    return quoted.then(|| unquote(&arg));
+                }
+            }
+            ',' if depth == 1 => last_start = k + 1,
+            _ => {}
+        }
+        k += 1;
+    }
+    None
+}
+
+/// Every string literal in Solidity source, comments skipped.
+fn literals(src: &str) -> Vec<String> {
+    let chars: Vec<char> = src.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if let Some(next) = skip_comment_or_string(&chars, i) {
+            if matches!(chars[i], '"' | '\'') {
+                out.push(unquote(&chars[i..next]));
+            }
+            i = next;
+        } else {
+            i += 1;
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone, Default)]
@@ -369,8 +518,8 @@ fn parse_campaign_stats(output: &str, r: &mut TestResult) {
 /// `Error != expected error: ...`. Anything else (panics, revert strings,
 /// custom errors, `EvmError`) means the code reverted before an assertion ran.
 ///
-/// Known gap: `assertTrue(x, "msg")` fails with just `msg` and is counted as a
-/// revert, so assertion kills are a lower bound.
+/// `assertTrue(x, "msg")` fails with just `msg`: [`Failure::kind_with`] counts
+/// that as an assertion when `msg` is one of the test's own messages.
 pub fn classify(reason: &str) -> FailKind {
     const COMPARISONS: [&str; 6] = [" != ", " == ", " < ", " > ", " <= ", " >= "];
     let r = reason.trim();
@@ -650,5 +799,46 @@ Encountered 1 failing test in test/generated/SoladyVault.inv.t.sol:SoladyVaultIn
         for (reason, want) in cases {
             assert_eq!(classify(reason), want, "reason: {reason:?}");
         }
+    }
+
+    #[test]
+    fn reads_the_tests_own_assertion_messages() {
+        let test = r#"
+            // assertTrue(x, "in a comment");
+            function test_a() public {
+                assertTrue(bank.ok(), "supply mismatch");
+                assertEq(f("not a message"), 2, 'single quoted');
+                assertTrue(g("only an argument"));
+                assertGe(a, b, string.concat("built", "up"));
+                fail("gave up");
+                emit log("not an assertion");
+                assertTrue(x, "insufficient balance");
+            }
+        "#;
+        let contract = r#"require(balanceOf[msg.sender] >= amount, "insufficient balance");"#;
+        assert_eq!(
+            assertion_messages(test, contract),
+            vec!["supply mismatch", "single quoted", "gave up"]
+        );
+        let messages = assertion_messages(test, contract);
+        let f = |reason: &str| Failure {
+            name: "t".into(),
+            reason: reason.into(),
+        };
+        // Just the message: an assertion once the test's messages are known.
+        assert_eq!(f("supply mismatch").kind(), FailKind::Revert);
+        assert_eq!(
+            f("supply mismatch").kind_with(&messages),
+            FailKind::Assertion
+        );
+        // The contract's own revert string stays a revert, even if a test uses it.
+        assert_eq!(
+            f("insufficient balance").kind_with(&messages),
+            FailKind::Revert
+        );
+        assert_eq!(
+            f("panic: arithmetic underflow or overflow (0x11)").kind_with(&messages),
+            FailKind::Revert
+        );
     }
 }

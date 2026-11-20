@@ -1,6 +1,6 @@
 [package]
 name = "ausweg"
-version = "0.6.5"
+version = "0.6.6"
 edition = "2024"
 description = "Proves every user can always get out of an ERC-4626 or ERC-7540 vault"
 license = "MIT OR Apache-2.0"

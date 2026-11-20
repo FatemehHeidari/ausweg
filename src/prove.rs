@@ -984,6 +984,11 @@ fn prepare(
                     "note: ausweg could not tell which requests {u} counts; the invariant leaves it out"
                 );
             }
+            for u in &learned.idle {
+                eprintln!(
+                    "note: {u} stayed 0 through the request, and its name is not about requests; the invariant leaves it out rather than pin it to 0"
+                );
+            }
             if progress == crate::asyncproof::Progress::Time && !stored.is_empty() {
                 eprintln!(
                     "note: ausweg reads running totals of owner-fulfilled vaults only; the invariant leaves {} out",
@@ -1053,6 +1058,23 @@ fn probe(
         );
     }
     if !result.passed.iter().any(|t| t == a::PROBE_RUNS) {
+        // A request with another id is invisible at id 0: say so, rather than
+        // that the request never became claimable.
+        if let Some(f) = result.failed.iter().find(|f| f.name == a::PROBE_ID_ZERO) {
+            let id = f
+                .reason
+                .trim_start_matches("assertion failed: ")
+                .split(" != ")
+                .next()
+                .unwrap_or("")
+                .trim();
+            bail!(
+                "the vault gave a request the id {id}, but ausweg reads every request at id 0, \
+                 one per controller, as ERC-7540's controller-only requests do; a vault that \
+                 numbers its requests is not supported yet ({})",
+                rel.display()
+            );
+        }
         let why = result
             .failed
             .iter()

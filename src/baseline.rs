@@ -345,6 +345,10 @@ pub(crate) fn score(
     // Mutants go to a copy of the project: the contract itself is never edited.
     let sandbox = Sandbox::new(repo)?;
     let file = sandbox.root.join(&target.rel);
+    // `assertTrue(x, "msg")` fails with just `msg`: the test's own messages say
+    // which failures are assertions.
+    let test_src = fs::read_to_string(repo.join(test_file)).unwrap_or_default();
+    let messages = crate::forge::assertion_messages(&test_src, &target.source);
 
     let mut detail = Vec::with_capacity(ms.len());
     for m in &ms {
@@ -361,13 +365,17 @@ pub(crate) fn score(
             Outcome::Invalid
         } else if caught.is_empty() {
             Outcome::Survived
-        } else if caught.iter().any(|f| f.kind() == FailKind::Assertion) {
+        } else if caught
+            .iter()
+            .any(|f| f.kind_with(&messages) == FailKind::Assertion)
+        {
             Outcome::Assertion
         } else {
             Outcome::RevertOnly
         };
-        let (by_assertion, by_revert): (Vec<&Failure>, Vec<&Failure>) =
-            caught.iter().partition(|f| f.kind() == FailKind::Assertion);
+        let (by_assertion, by_revert): (Vec<&Failure>, Vec<&Failure>) = caught
+            .iter()
+            .partition(|f| f.kind_with(&messages) == FailKind::Assertion);
         detail.push(MutantOutcome {
             line: m.line,
             change: m.change.clone(),
