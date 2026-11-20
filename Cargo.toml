@@ -1,0 +1,20 @@
+[package]
+name = "ausweg"
+version = "0.6.0"
+edition = "2024"
+description = "Proves every user can always get out of an ERC-4626 or ERC-7540 vault"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/FatemehHeidari/ausweg"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.8", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+ureq = { version = "3.5.2", features = ["json"] }
+num-bigint = "0.4"
+num-traits = "0.2"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3.27.0"
