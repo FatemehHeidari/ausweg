@@ -548,6 +548,12 @@ fn print_proof_summary(r: &prove::ProveReport) {
         }
         println!("{line}");
     }
+    if !r.left_out.is_empty() {
+        println!("- left out by the model: {}", r.left_out.join(", "));
+    }
+    for u in &r.unchecked {
+        println!("- no keeps check: {}: {}", u.function, u.reason);
+    }
     if r.liquidity_proved {
         match &r.exit {
             None => println!(
@@ -561,6 +567,14 @@ fn print_proof_summary(r: &prove::ProveReport) {
                 }
             ),
         }
+    } else if !r.unchecked.is_empty() && r.checks.iter().all(|c| c.verdict == Verdict::Proved) {
+        println!(
+            "- liquidity: not proved: every check passed, but {} has no keeps check, so the induction is incomplete",
+            match r.unchecked.len() {
+                1 => "1 state-changing entry point".to_string(),
+                n => format!("{n} state-changing entry points"),
+            }
+        );
     } else {
         println!("- liquidity: not proved (see the checks above)");
     }

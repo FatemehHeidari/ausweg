@@ -165,13 +165,14 @@ From a run on `examples/SolmateVault.sol`, mutation scoring left out (`--no-muta
 - invariant: alice, bob, carol hold every share and asset token; asset supply <= 2^96; share price >= 1
 - checks: 14 -> 14 proved, 0 counterexample, 0 timeout, 0 vacuous, 0 error -> test/generated/SolmateVault.proof.t.sol
   - proved: exit redeem (1.3s, 30 paths)
-  - proved: exit withdraw (1.8s, 33 paths)
+  - proved: exit withdraw (1.9s, 33 paths)
   - proved: init (0.1s, 1 paths)
-  - proved: keeps deposit (16.9s, 446 paths)
+  - proved: keeps deposit (16.2s, 440 paths)
   - ...
-  - proved: keeps withdraw (49.0s, 1025 paths)
+  - proved: keeps withdraw (38.8s, 959 paths)
+- left out by the model: permit (needs a signature)
 - liquidity: proved: from every reachable state of the three-user world, every user can redeem every share they hold, and withdraw what maxWithdraw quotes
-- time: 169s
+- time: 148s
 ```
 
 | Check | What it proves |
@@ -180,11 +181,15 @@ From a run on `examples/SolmateVault.sol`, mutation scoring left out (`--no-muta
 | `keeps <f>` | From any state that satisfies the invariant, `<f>` keeps it, for any of the three users as caller and any arguments. One per state-changing function of the vault, plus the asset's `transfer`, `transferFrom`, `approve` and `mint` (yield or new funds, up to the supply cap). |
 | `exit redeem` | From any state that satisfies the invariant, each user who holds shares redeems all of them in one call: no revert, at least what `previewRedeem` promised, and no shares left. |
 | `exit withdraw` | Each user withdraws what `maxWithdraw` quotes, without a revert, burning at most what `previewWithdraw` says. |
-| liquidity proved | Every check proved: by induction, every reachable state satisfies the invariant, and from each one every user can get out. |
+| left out by the model | A state-changing function the model excludes on purpose, with why: `permit` needs a signature. |
+| no keeps check | A state-changing entry point the proof cannot call: one with an argument it cannot fill in (an array, a struct, `bytes`, a `string`), a payable function (its check sends no ether), or a fallback or receive function. Any one of them withholds "liquidity: proved". |
+| liquidity proved | Every check proved, and every state-changing entry point has its keeps check: by induction, every reachable state satisfies the invariant, and from each one every user can get out. |
 | counterexample | A state, with its numbers named (`totalSupply`, `totalAssets`, `userShares`, the user), where the check fails. |
 | timeout, vacuous | The solver ran out of `--solver-timeout` (default 60 s per query); or every path was cut by an assumption, so nothing was checked. |
 
 Since 0.6.1, `exit redeem` takes the user's whole balance rather than what `maxRedeem` quotes, and a preview or max view that reverts fails the check: Halmos drops a path that reverts, so the state would otherwise go unchecked. `examples/HalfExitVault.sol` lets a user take out at most half their shares at a time, rounded down, so a last share is stuck. 0.6.0 proved it; 0.6.1 reports `COUNTEREXAMPLE: exit redeem: i = carol, totalAssets = 2, totalSupply = 2, userShares = 2`.
+
+Since 0.6.2, a state-changing function with no keeps check withholds the verdict, since the induction then misses a transition. `examples/SweepVault.sol` lets anyone send all of the vault's assets away with `sweep(address[])`, which the proof cannot call. 0.6.0 proved it; 0.6.2 reports `no keeps check: sweep(address[]): takes address[], which the proof cannot fill in` and `liquidity: not proved`.
 
 The invariant: alice, bob and carol, plus any address the constructor takes (a fee treasury), hold every share and every asset token, the vault holding its own assets; the asset's supply is at most 2^96; and the share price is at least 1, `totalAssets() >= totalSupply()`. `--no-price` leaves the last part out: on Solmate the exit check then fails, because a share worth less than one asset unit redeems to 0 and Solmate's `redeem` reverts with `ZERO_ASSETS`.
 

@@ -113,8 +113,14 @@ pub struct ProveReport {
     /// probe saw the vault do with one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit: Option<AsyncExit>,
+    /// State-changing functions the model leaves out on purpose, with why.
+    pub left_out: Vec<String>,
+    /// State-changing entry points with no full keeps check; any of them
+    /// withholds liquidity_proved.
+    pub unchecked: Vec<Unchecked>,
     pub checks: Vec<Check>,
-    /// Every check proved: exit holds in every reachable state of the world.
+    /// Every check proved, and every state-changing entry point checked: exit
+    /// holds in every reachable state of the world.
     pub liquidity_proved: bool,
     pub seconds: f64,
     pub mutation: Option<ProofMutation>,
@@ -137,9 +143,103 @@ const NEEDED: [&str; 13] = [
     "transfer",
 ];
 
-/// Calls that only need a signature: they change allowances, which the
-/// invariant does not mention.
-const SKIP: &[&str] = &["permit"];
+/// Calls the model leaves out, and why: a signed call changes allowances,
+/// which the invariant does not mention.
+const SKIP: &[(&str, &str)] = &[("permit", "needs a signature")];
+
+/// A state-changing entry point the proof has no keeps check for, and why.
+/// The induction needs one for every transition, so any of these withholds
+/// "liquidity: proved".
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+pub struct Unchecked {
+    pub function: String,
+    pub reason: String,
+}
+
+/// `sweep(address[])`, `setFees(FeeConfig)`: a function's name and argument types.
+pub(crate) fn short_signature(item: &Item) -> String {
+    let tys: Vec<String> = item.inputs.iter().map(display_type).collect();
+    format!("{}({})", item.name, tys.join(", "))
+}
+
+/// A parameter's declared type, without `contract `/`struct `/`enum ` or the
+/// declaring contract: `struct Vault.FeeConfig[]` -> `FeeConfig[]`.
+fn display_type(p: &Param) -> String {
+    let t = if p.internal_type.is_empty() {
+        p.ty.as_str()
+    } else {
+        p.internal_type.as_str()
+    };
+    let t = ["contract ", "struct ", "enum "]
+        .iter()
+        .find_map(|pre| t.strip_prefix(pre))
+        .unwrap_or(t);
+    t.rsplit('.').next().unwrap_or(t).to_string()
+}
+
+/// Why the proof cannot call `item`, if it cannot: an argument it has no way
+/// to fill in.
+pub(crate) fn no_check_reason(item: &Item) -> Option<String> {
+    let odd: Vec<String> = item
+        .inputs
+        .iter()
+        .filter(|p| !p.is_supported())
+        .map(display_type)
+        .collect();
+    if odd.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "takes {}, which the proof cannot fill in",
+            odd.join(" and ")
+        ))
+    }
+}
+
+/// Sorts the vault's state-changing functions into what the model leaves out
+/// (`skip`, with reasons), and what gets no full check: an argument the proof
+/// cannot fill in, ether a payable call is never sent, and a fallback or
+/// receive function, which runs on calls no check makes. `checked` says
+/// whether a function got its checks.
+pub(crate) fn coverage(
+    abi: &Abi,
+    skip: &[(&str, &str)],
+    checked: &dyn Fn(&Item) -> bool,
+) -> (Vec<String>, Vec<Unchecked>) {
+    let mut left_out = Vec::new();
+    let mut unchecked = Vec::new();
+    for item in abi.mutating() {
+        if let Some((_, why)) = skip.iter().find(|(n, _)| *n == item.name) {
+            let entry = format!("{} ({why})", item.name);
+            if !left_out.contains(&entry) {
+                left_out.push(entry);
+            }
+        } else if !checked(item) {
+            unchecked.push(Unchecked {
+                function: short_signature(item),
+                reason: no_check_reason(item)
+                    .unwrap_or_else(|| "the proof does not call it".to_string()),
+            });
+        } else if item.mutability == "payable" {
+            unchecked.push(Unchecked {
+                function: short_signature(item),
+                reason: "payable, and its check sends no ether".to_string(),
+            });
+        }
+    }
+    for item in &abi.items {
+        let reason = match item.kind.as_str() {
+            "fallback" => "runs on any call the ABI does not name",
+            "receive" => "runs on plain ether transfers",
+            _ => continue,
+        };
+        unchecked.push(Unchecked {
+            function: format!("{}()", item.kind),
+            reason: reason.to_string(),
+        });
+    }
+    (left_out, unchecked)
+}
 
 pub fn supports(abi: &Abi) -> Result<()> {
     let missing: Vec<&str> = NEEDED
@@ -182,6 +282,10 @@ pub(crate) fn typed(p: &Param, address_expr: &str) -> String {
 pub struct Proof {
     pub source: String,
     pub checks: Vec<String>,
+    /// State-changing functions the model leaves out on purpose, with why.
+    pub left_out: Vec<String>,
+    /// State-changing entry points with no full keeps check.
+    pub unchecked: Vec<Unchecked>,
     pub other_holders: Vec<String>,
     /// For an ERC-7540 vault: how a request becomes claimable, and what the
     /// probe saw the vault do with one.
@@ -328,8 +432,9 @@ pub fn render(
 
     let mut checks = vec!["check_init".to_string()];
     let mut keeps = String::new();
+    let mut got: Vec<String> = Vec::new();
     for item in abi.mutating() {
-        if SKIP.contains(&item.name.as_str()) {
+        if SKIP.iter().any(|(n, _)| *n == item.name) {
             continue;
         }
         let base = format!("check_keeps_{}", item.name);
@@ -343,8 +448,10 @@ pub fn render(
             keeps.push_str(&f);
             keeps.push('\n');
             checks.push(name);
+            got.push(short_signature(item));
         }
     }
+    let (left_out, unchecked) = coverage(abi, SKIP, &|item| got.contains(&short_signature(item)));
     for n in [
         "check_keeps_asset_transfer",
         "check_keeps_asset_transferFrom",
@@ -578,9 +685,23 @@ contract {c}Proof is Test {{
     Ok(Proof {
         source,
         checks,
+        left_out,
+        unchecked,
         other_holders: passive,
         exit: None,
     })
+}
+
+/// Liquidity is proved when Halmos proved every check the proof wrote, and the
+/// proof wrote a full keeps check for every state-changing entry point.
+pub(crate) fn liquidity(checks: &[Check], proof: &Proof) -> bool {
+    !checks.is_empty()
+        && checks.iter().all(|c| c.verdict == Verdict::Proved)
+        && proof
+            .checks
+            .iter()
+            .all(|n| checks.iter().any(|c| &c.name == n))
+        && proof.unchecked.is_empty()
 }
 
 // ---------------------------------------------------------------- running
@@ -976,12 +1097,7 @@ pub fn run(
     let Some(checks) = checks else {
         bail!("Halmos did not run the proof:\n{}", log_tail(&log));
     };
-    let liquidity_proved = !checks.is_empty()
-        && checks.iter().all(|c| c.verdict == Verdict::Proved)
-        && proof
-            .checks
-            .iter()
-            .all(|n| checks.iter().any(|c| &c.name == n));
+    let liquidity_proved = liquidity(&checks, &proof);
 
     let mut report = ProveReport {
         contract: contract.display().to_string(),
@@ -990,6 +1106,8 @@ pub fn run(
         price_at_least_one: opts.price,
         amounts_bounded: opts.bound_amounts,
         exit: proof.exit,
+        left_out: proof.left_out,
+        unchecked: proof.unchecked,
         checks,
         liquidity_proved,
         seconds: 0.0,
@@ -1387,6 +1505,74 @@ mod tests {
             p.source
                 .contains("vm.assume(callerI < 3 && assets <= MAX_AMOUNT && receiverI < 3);")
         );
+    }
+
+    #[test]
+    fn lists_what_the_proof_does_not_check() {
+        let abi = Abi::parse(
+            r#"{"abi":[
+              {"type":"function","name":"deposit","inputs":[{"name":"assets","type":"uint256","internalType":"uint256"},{"name":"receiver","type":"address","internalType":"address"}],"outputs":[],"stateMutability":"nonpayable"},
+              {"type":"function","name":"permit","inputs":[{"name":"owner","type":"address","internalType":"address"}],"outputs":[],"stateMutability":"nonpayable"},
+              {"type":"function","name":"sweep","inputs":[{"name":"to","type":"address[]","internalType":"address[]"}],"outputs":[],"stateMutability":"nonpayable"},
+              {"type":"function","name":"setFees","inputs":[{"name":"c","type":"tuple","internalType":"struct Vault.FeeConfig"}],"outputs":[],"stateMutability":"nonpayable"},
+              {"type":"function","name":"depositEth","inputs":[],"outputs":[],"stateMutability":"payable"},
+              {"type":"function","name":"totalAssets","inputs":[],"outputs":[{"name":"","type":"uint256","internalType":"uint256"}],"stateMutability":"view"},
+              {"type":"receive","stateMutability":"payable"}
+            ]}"#,
+        )
+        .unwrap();
+        let (left_out, unchecked) = coverage(&abi, SKIP, &|i| no_check_reason(i).is_none());
+        assert_eq!(left_out, vec!["permit (needs a signature)"]);
+        let got: Vec<(&str, &str)> = unchecked
+            .iter()
+            .map(|u| (u.function.as_str(), u.reason.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (
+                    "sweep(address[])",
+                    "takes address[], which the proof cannot fill in"
+                ),
+                (
+                    "setFees(FeeConfig)",
+                    "takes FeeConfig, which the proof cannot fill in"
+                ),
+                ("depositEth()", "payable, and its check sends no ether"),
+                ("receive()", "runs on plain ether transfers"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_function_without_a_check_withholds_the_verdict() {
+        let mut abi = Abi::parse(OZ_VAULT_ABI).unwrap();
+        let sweep: crate::abi::Item = serde_json::from_str(
+            r#"{"type":"function","name":"sweep","inputs":[{"name":"to","type":"address[]","internalType":"address[]"}],"outputs":[],"stateMutability":"nonpayable"}"#,
+        )
+        .unwrap();
+        abi.items.push(sweep);
+        let mut p = render("OZVault", "../../src/OZVault.sol", &abi, true, false).unwrap();
+        assert!(!p.checks.iter().any(|n| n.contains("sweep")));
+        // The fixture's own batch(uint256[]) has no check either.
+        let names: Vec<&str> = p.unchecked.iter().map(|u| u.function.as_str()).collect();
+        assert_eq!(names, vec!["batch(uint256[])", "sweep(address[])"]);
+        assert_eq!(p.left_out, vec!["permit (needs a signature)"]);
+        // Halmos proves every check the proof wrote: still no verdict.
+        let all_proved: Vec<Check> = p
+            .checks
+            .iter()
+            .map(|n| Check {
+                name: n.clone(),
+                verdict: Verdict::Proved,
+                seconds: 0.0,
+                paths: 1,
+                counterexample: vec![],
+            })
+            .collect();
+        assert!(!liquidity(&all_proved, &p));
+        p.unchecked.clear();
+        assert!(liquidity(&all_proved, &p));
     }
 
     #[test]

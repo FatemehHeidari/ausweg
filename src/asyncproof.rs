@@ -358,12 +358,12 @@ impl Style {
 
 /// Calls the checks leave out: signatures, and changes of owner (the fairness
 /// assumption is about whoever owns the vault).
-const SKIP: &[&str] = &[
-    "permit",
-    "authorizeOperator",
-    "transferOwnership",
-    "renounceOwnership",
-    "acceptOwnership",
+const SKIP: &[(&str, &str)] = &[
+    ("permit", "needs a signature"),
+    ("authorizeOperator", "needs a signature"),
+    ("transferOwnership", "changes the owner"),
+    ("renounceOwnership", "changes the owner"),
+    ("acceptOwnership", "changes the owner"),
 ];
 
 /// One generated check per family for a vault function.
@@ -466,13 +466,15 @@ pub fn render(
     let mut keeps = String::new();
     let mut stable = String::new();
     let mut fair = String::new();
+    let mut got: Vec<String> = Vec::new();
     for item in abi.mutating() {
-        if SKIP.contains(&item.name.as_str()) {
+        if SKIP.iter().any(|(n, _)| *n == item.name) {
             continue;
         }
         let Some(c) = call(item, bound) else {
             continue;
         };
+        got.push(crate::prove::short_signature(item));
         let k = unique(&checks, format!("check_keeps_{}", item.name));
         keeps.push_str(&format!(
             "    /// {sig}: keeps the invariant, for any user or the owner as caller.\n    function {k}({ps}) public {{\n        vm.assume({asm});\n{any_time}        vm.assume(_inv());\n        _witness();\n        vm.prank(_caller(callerI));\n        try {call} {{\n            assert(_holds());\n        }} catch {{}}\n    }}\n\n",
@@ -501,6 +503,9 @@ pub fn render(
         ));
         checks.push(f);
     }
+    let (left_out, unchecked) = crate::prove::coverage(abi, SKIP, &|item| {
+        got.contains(&crate::prove::short_signature(item))
+    });
     for n in [
         "check_keeps_asset_transfer",
         "check_keeps_asset_transferFrom",
@@ -701,6 +706,8 @@ pub fn render(
     Ok(Proof {
         source,
         checks,
+        left_out,
+        unchecked,
         other_holders: Vec::new(),
         exit: None,
     })
@@ -1375,6 +1382,12 @@ mod tests {
             );
         }
         assert!(!p.source.contains("transferOwnership"));
+        // Left out by the model, and said so; nothing else goes unchecked.
+        assert!(
+            p.left_out
+                .contains(&"transferOwnership (changes the owner)".to_string())
+        );
+        assert!(p.unchecked.is_empty(), "{:?}", p.unchecked);
         assert!(!p.source.contains('@'), "unfilled placeholder");
         assert!(
             p.source
