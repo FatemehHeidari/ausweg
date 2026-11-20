@@ -2,7 +2,7 @@
 
 Give `ausweg` an ERC-4626 or ERC-7540 vault, and it proves that every user can always get out, or reports a counterexample, or says which checks it could not decide. The specification is built in, so there is none to write per vault: `ausweg` writes the proof for [Halmos](https://github.com/a16z/halmos) from the vault's ABI and one concrete run of the vault.
 
-The proof is about a model of the vault's world: three users and the owner, and a plain ERC-20 asset (no fees, blocklists or pauses) with a supply of at most 2^96. In it, from every reachable state, each user can redeem every share they hold in one call. In an ERC-7540 vault, each user can get out in three steps (request, fulfilment or a delay, claim) if the owner eventually fulfils requests, and no other user, nor the owner, can shrink a request or lower the share price on the way. Ownership changes and calls that need a signature are left out.
+The proof is about a model of the vault's world: three users and the owner, and a plain ERC-20 asset (no fees, blocklists or pauses) with a supply of at most 2^96. In it, from every reachable state, each user can redeem every share they hold in one call. In an ERC-7540 vault, each user can get out in three steps (request, fulfilment or a delay, claim) if the owner eventually fulfils requests, and no other user, nor the owner, can shrink a request or lower the share price on the way, unless the user gave them an allowance or operator rights. Ownership changes and calls that need a signature are left out.
 
 So far: a vault built on Solmate's ERC-4626, 14 of 14 checks proved; OpenZeppelin Community Contracts' ERC-7540 with admin-fulfilled redemptions, unchanged under a 30-line wrapper, 48 of 48.
 
@@ -205,14 +205,14 @@ A vault with `requestRedeem`, `pendingRedeemRequest` and `claimableRedeemRequest
 
 | Check | What it proves |
 | --- | --- |
-| `request` | Bob can turn all his shares into a request, keeping the one he had. |
-| `fulfil` or `mature` | The owner can make bob's whole request claimable; or, once the delay is over, it is claimable. |
-| `claim redeem`, `claim withdraw` | Bob can claim everything claimable and is paid every claimable asset. |
+| `request` | Each user can turn all their shares into a request, keeping the one they had. |
+| `fulfil` or `mature` | The owner can make a user's whole request claimable; or, once the delay is over, it is claimable. |
+| `claim redeem`, `claim withdraw` | Each user can claim everything claimable and is paid every claimable asset. |
 | `stable <f>` | Called by alice or by the owner, `<f>` does not shrink bob's request, or, with a delay, push back what he can claim. |
 | `fair <f>` | Called by alice or by the owner, `<f>` does not lower the share price. Checked from any state with the shares accounted for. |
 | `init`, `keeps <f>` | The invariant, as in Step 13, plus the vault's accounting for requests; callers include the owner. |
 
-All proved means: from every reachable state, every user can get out in three steps, if the owner eventually fulfils requests (or as time passes), and no other user, nor the owner, can shrink a request or lower the share price on the way. Alice stands for any other user: the users are interchangeable, so checking one of them covers the others. The owner is the test contract that deployed the vault; changes of owner (`transferOwnership`) and calls that need a signature (`permit`, `authorizeOperator`) are left out.
+All proved means: from every reachable state, every user can get out in three steps, if the owner eventually fulfils requests (or as time passes), and no other user, nor the owner, can shrink a request or lower the share price on the way. Since 0.6.5 the three exit steps are checked for each of alice, bob and carol. The stable and fair checks still protect bob against alice and the owner: that covers every pair of users because they are interchangeable, which holds unless the vault's code singles out an address, since all of its storage is symbolic. They also assume no delegation: the other caller has no allowance or operator rights over bob's shares, because a user who delegates lets the delegate act for them. The owner is the test contract that deployed the vault; changes of owner (`transferOwnership`) and calls that need a signature (`permit`, `authorizeOperator`) are left out.
 
 Vaults keep a request's shares and assets in different places. Before writing the invariant, ausweg runs one request through the vault in a forge test, `test/generated/<Name>.style.t.sol`: a deposit, a request of 400 of 1000 shares, then the fulfilment or ten years. Which of its tests pass tells ausweg whether the vault burns the shares, and sets the assets aside, at the request or at the fulfilment. The invariant then says the vault holds exactly the shares, and sets aside exactly the assets, of the requests it keeps. The report's `exit:` line says what the probe saw.
 

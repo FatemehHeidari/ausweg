@@ -1,18 +1,22 @@
 //! Step 15: liquidity for ERC-7540 vaults, whose exits take three calls.
 //!
-//! Bob first calls `requestRedeem`; then the owner calls `fulfillRedeem`, or a
-//! delay passes; only then can bob `redeem` or `withdraw`. ausweg proves, from
-//! every state the vault can reach:
-//! - request: bob can turn all his shares into a request;
-//! - fulfil (owner) or mature (delay): his whole request becomes claimable;
-//! - claim: he can claim everything claimable and is paid every claimable asset;
-//! - stable: no call by another user or the owner shrinks his request, or, for
-//!   a delay, pushes back what he can claim;
-//! - fair: no call by another user or the owner lowers the share price;
+//! A user first calls `requestRedeem`; then the owner calls `fulfillRedeem`, or
+//! a delay passes; only then can the user `redeem` or `withdraw`. ausweg
+//! proves, from every state the vault can reach:
+//! - request: each user can turn all their shares into a request;
+//! - fulfil (owner) or mature (delay): their whole request becomes claimable;
+//! - claim: they can claim everything claimable and are paid every claimable
+//!   asset;
+//! - stable: no call by alice (for any other user) or the owner shrinks bob's
+//!   request, or, for a delay, pushes back what he can claim;
+//! - fair: no call by alice or the owner lowers the share price;
 //! - keeps: the invariant is inductive, as in Step 13.
 //!
-//! The owner fulfilling eventually, or time passing, is the fairness
-//! assumption; bob's own steps are his choice, so they only need to succeed.
+//! The chain is checked for each of the three users. Stable and fair take bob
+//! for every user and alice for every other one: the users are interchangeable
+//! unless the vault's code singles out an address, since every storage slot is
+//! symbolic. The owner fulfilling eventually, or time passing, is the fairness
+//! assumption; a user's own steps are their choice, so they only need to succeed.
 //!
 //! Vaults keep requested shares in different ways: in the vault until the
 //! claim, or burned at the request or at the fulfilment, with their assets set
@@ -837,12 +841,14 @@ pragma solidity ^0.8.0;
 @PROGRESS_LINE@
 // The vault, as the probe saw it: @STYLE_LINE@.
 @LEARNED_LINES@//
-// The chain, each link proved from any state that satisfies _inv():
-//   check_request: bob can turn all his shares into a request;
-//   check_fulfil / check_mature: his whole request becomes claimable;
-//   check_claim_*: he can claim everything claimable and is paid for it.
-// check_stable_*: no call by alice (any other user) or the owner shrinks bob's
-//   request. check_fair_*: none lowers the share price.
+// The chain, each link proved for each user from any state that satisfies _inv():
+//   check_request: the user can turn all their shares into a request;
+//   check_fulfil / check_mature: their whole request becomes claimable;
+//   check_claim_*: they can claim everything claimable and are paid for it.
+// check_stable_*: no call by alice (for any other user) or the owner shrinks bob's
+//   request. check_fair_*: none lowers the share price. These two take bob for
+//   every user and alice for every other one, and assume no delegation: the
+//   caller has no allowance or operator rights over bob's shares.
 // check_keeps_*: the invariant is inductive.
 // Each check makes its call in a try: a call that reverts changes nothing, so
 // only a call that succeeds is checked, and a check is vacuous only when its
@@ -1005,55 +1011,61 @@ contract @C@Proof is Test {
         assert(_holds());
     }
 
-    /// Bob can turn all his shares into a request, keeping the one he had.
-    function check_request() public {
+    /// User i can turn all their shares into a request, keeping the one they had.
+    function check_request(uint256 i) public {
+        vm.assume(i < 3);
+        address u = _user(i);
 @ANY_TIME@        vm.assume(_inv());
         _witness();
-        uint256 s = target.balanceOf(bob);
-        vm.assume(s == svm.createUint256("bobShares"));
+        uint256 s = target.balanceOf(u);
+        vm.assume(s == svm.createUint256("userShares"));
         vm.assume(s > 0);
-        uint256 before = _pending(bob) + _claimable(bob);
+        uint256 before = _pending(u) + _claimable(u);
         // Records of up to 2^96 shares, the supply cap.
         vm.assume(before <= CAP);
-        vm.startPrank(bob);
+        vm.startPrank(u);
         target.approve(address(target), s);
-        try target.requestRedeem(s, bob, bob) {
-            assert(_pending(bob) + _claimable(bob) == before + s);
+        try target.requestRedeem(s, u, u) {
+            assert(_pending(u) + _claimable(u) == before + s);
         } catch {
             assert(false);
         }
         vm.stopPrank();
     }
 @CHAIN@
-    /// Bob can redeem everything claimable, and is paid every claimable asset.
-    function check_claim_redeem() public {
+    /// User i can redeem everything claimable, and is paid every claimable asset.
+    function check_claim_redeem(uint256 i) public {
+        vm.assume(i < 3);
+        address u = _user(i);
 @ANY_TIME@        vm.assume(_inv());
         _witness();
-        uint256 c = _claimable(bob);
-        vm.assume(c == svm.createUint256("bobClaimable"));
+        uint256 c = _claimable(u);
+        vm.assume(c == svm.createUint256("userClaimable"));
         vm.assume(c > 0 && c <= CAP);
-        uint256 owed = target.maxWithdraw(bob);
-        uint256 before = asset.balanceOf(bob);
-        vm.prank(bob);
-        try target.redeem(c, bob, bob) returns (uint256 paid) {
+        uint256 owed = target.maxWithdraw(u);
+        uint256 before = asset.balanceOf(u);
+        vm.prank(u);
+        try target.redeem(c, u, u) returns (uint256 paid) {
             assert(paid >= owed);
-            assert(asset.balanceOf(bob) == before + paid);
+            assert(asset.balanceOf(u) == before + paid);
         } catch {
             assert(false);
         }
     }
 
-    /// Bob can withdraw every claimable asset.
-    function check_claim_withdraw() public {
+    /// User i can withdraw every claimable asset.
+    function check_claim_withdraw(uint256 i) public {
+        vm.assume(i < 3);
+        address u = _user(i);
 @ANY_TIME@        vm.assume(_inv());
         _witness();
-        uint256 owed = target.maxWithdraw(bob);
-        vm.assume(owed == svm.createUint256("bobClaimableAssets"));
-        vm.assume(owed > 0 && _claimable(bob) <= CAP);
-        uint256 before = asset.balanceOf(bob);
-        vm.prank(bob);
-        try target.withdraw(owed, bob, bob) {
-            assert(asset.balanceOf(bob) == before + owed);
+        uint256 owed = target.maxWithdraw(u);
+        vm.assume(owed == svm.createUint256("userClaimableAssets"));
+        vm.assume(owed > 0 && _claimable(u) <= CAP);
+        uint256 before = asset.balanceOf(u);
+        vm.prank(u);
+        try target.withdraw(owed, u, u) {
+            assert(asset.balanceOf(u) == before + owed);
         } catch {
             assert(false);
         }
@@ -1225,19 +1237,21 @@ const OWED_LATER: &str = r#"
 "#;
 
 const CHAIN_OWNER: &str = r#"
-    /// The owner can make bob's whole pending request claimable.
-    function check_fulfil() public {
+    /// The owner can make user i's whole pending request claimable.
+    function check_fulfil(uint256 i) public {
+        vm.assume(i < 3);
+        address u = _user(i);
         vm.assume(_inv());
         _witness();
-        uint256 p = _pending(bob);
-        vm.assume(p == svm.createUint256("bobPending"));
+        uint256 p = _pending(u);
+        vm.assume(p == svm.createUint256("userPending"));
         vm.assume(p > 0);
-        uint256 before = _claimable(bob);
+        uint256 before = _claimable(u);
         // Records of up to 2^96 shares, the supply cap.
         vm.assume(before <= CAP);
-        try target.fulfillRedeem(bob, p) {
-            assert(_pending(bob) == 0);
-            assert(_claimable(bob) == before + p);
+        try target.fulfillRedeem(u, p) {
+            assert(_pending(u) == 0);
+            assert(_claimable(u) == before + p);
         } catch {
             assert(false);
         }
@@ -1245,16 +1259,18 @@ const CHAIN_OWNER: &str = r#"
 "#;
 
 const CHAIN_TIME: &str = r#"
-    /// Once the delay is over, bob's whole request is claimable.
-    function check_mature() public {
+    /// Once the delay is over, user i's whole request is claimable.
+    function check_mature(uint256 i) public {
+        vm.assume(i < 3);
+        address u = _user(i);
         _anyTime();
         vm.assume(_inv());
         _witness();
-        uint256 r = _pending(bob) + _claimable(bob);
-        vm.assume(r == svm.createUint256("bobRequested"));
+        uint256 r = _pending(u) + _claimable(u);
+        vm.assume(r == svm.createUint256("userRequested"));
         vm.assume(r > 0);
         vm.warp(LATEST);
-        assert(_claimable(bob) == r);
+        assert(_claimable(u) == r);
     }
 "#;
 
@@ -1388,6 +1404,23 @@ mod tests {
                 .contains(&"transferOwnership (changes the owner)".to_string())
         );
         assert!(p.unchecked.is_empty(), "{:?}", p.unchecked);
+        // The chain runs for each of the three users, not only bob.
+        for f in [
+            "check_request",
+            "check_fulfil",
+            "check_claim_redeem",
+            "check_claim_withdraw",
+        ] {
+            assert!(
+                p.source.contains(&format!(
+                    "function {f}(uint256 i) public {{\n        vm.assume(i < 3);\n        address u = _user(i);"
+                )),
+                "{f} is not per user"
+            );
+        }
+        assert!(p.source.contains("try target.requestRedeem(s, u, u) {"));
+        assert!(p.source.contains("try target.fulfillRedeem(u, p) {"));
+        assert!(!p.source.contains("requestRedeem(s, bob, bob)"));
         assert!(!p.source.contains('@'), "unfilled placeholder");
         assert!(
             p.source
