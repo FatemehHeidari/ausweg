@@ -498,9 +498,11 @@ mod tests {
                 output: String::new(),
             })
         }
-        fn test(&self, _: &Path, _: &str) -> Result<TestResult> {
-            let src = fs::read_to_string(&self.contract)?;
-            let tests = fs::read_to_string(&self.test_file)?;
+        fn test(&self, repo: &Path, test_file: &str) -> Result<TestResult> {
+            // Mutants run in a copy of the project; the contract itself never changes.
+            assert_eq!(fs::read_to_string(&self.contract)?, SOURCE);
+            let src = fs::read_to_string(repo.join("src/OZVault.sol"))?;
+            let tests = fs::read_to_string(repo.join(test_file))?;
             let mut r = TestResult {
                 ran: true,
                 calls: Some(2048),

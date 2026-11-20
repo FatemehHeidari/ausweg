@@ -73,33 +73,102 @@ pub enum Outcome {
     Invalid,
 }
 
-/// Copy of the original contract kept on disk while it is being mutated, e.g.
-/// `src/Bank.sol.ausweg-backup`. Drop cannot run on Ctrl-C or a crash; the backup
-/// lets the next run put the original back.
+/// Where ausweg before 0.6.4 kept the original contract while it wrote mutants
+/// over it, e.g. `src/Bank.sol.ausweg-backup`. A run killed mid-mutation left
+/// both behind. Mutants now go to a [`Sandbox`], so only an older run leaves one.
 pub(crate) fn backup_path(contract_abs: &Path) -> PathBuf {
     let mut p = contract_abs.as_os_str().to_owned();
     p.push(".ausweg-backup");
     PathBuf::from(p)
 }
 
-/// Restores the original contract even if scoring panics or errors out.
-pub(crate) struct Restore<'a> {
-    pub(crate) path: &'a Path,
-    pub(crate) backup: &'a Path,
-    pub(crate) original: &'a str,
+/// A copy of the Foundry project in the system temp directory, where mutants
+/// are written, so the project itself is never edited. Dependency folders are
+/// linked, not copied; `.git`, `out` and `cache` stay behind, and forge builds
+/// the copy afresh. Removed when dropped; a crash leaves it in the temp
+/// directory, never in the project.
+pub(crate) struct Sandbox {
+    pub(crate) root: PathBuf,
 }
-impl Drop for Restore<'_> {
-    fn drop(&mut self) {
-        // Delete the backup only once the original is safely back.
-        if fs::write(self.path, self.original).is_ok() {
-            let _ = fs::remove_file(self.backup);
+
+/// Folders the sandbox links to instead of copying.
+const LINKED: &[&str] = &["lib", "node_modules", "dependencies"];
+/// Folders the sandbox leaves out.
+const LEFT_OUT: &[&str] = &[".git", "out", "cache"];
+
+impl Sandbox {
+    pub(crate) fn new(repo: &Path) -> Result<Self> {
+        let repo = fs::canonicalize(repo).with_context(|| format!("reading {}", repo.display()))?;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let root =
+            std::env::temp_dir().join(format!("ausweg-mutants-{}-{stamp}", std::process::id()));
+        fs::create_dir_all(&root)?;
+        // From here on, Drop removes the copy if anything fails.
+        let sandbox = Self { root };
+        for entry in fs::read_dir(&repo)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if LEFT_OUT.contains(&name.as_ref()) {
+                continue;
+            }
+            let to = sandbox.root.join(entry.file_name());
+            if LINKED.contains(&name.as_ref()) {
+                link(&fs::canonicalize(entry.path())?, &to)?;
+            } else {
+                copy_tree(&entry.path(), &to)?;
+            }
         }
+        Ok(sandbox)
     }
 }
 
-/// The contract under test, read after undoing any interrupted run.
+impl Drop for Sandbox {
+    fn drop(&mut self) {
+        // remove_dir_all removes a symbolic link, never what it points to: the
+        // linked dependencies stay.
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+#[cfg(unix)]
+fn link(target: &Path, at: &Path) -> Result<()> {
+    std::os::unix::fs::symlink(target, at)
+        .with_context(|| format!("linking {} to {}", at.display(), target.display()))
+}
+
+#[cfg(not(unix))]
+fn link(target: &Path, at: &Path) -> Result<()> {
+    copy_tree(target, at)
+}
+
+fn copy_tree(from: &Path, to: &Path) -> Result<()> {
+    let meta = fs::symlink_metadata(from)?;
+    if meta.file_type().is_symlink() {
+        // Point at the same place from the copy: absolute when it resolves.
+        let target = fs::canonicalize(from).or_else(|_| fs::read_link(from))?;
+        link(&target, to)
+    } else if meta.is_dir() {
+        fs::create_dir_all(to)?;
+        for e in fs::read_dir(from)? {
+            let e = e?;
+            copy_tree(&e.path(), &to.join(e.file_name()))?;
+        }
+        Ok(())
+    } else {
+        fs::copy(from, to).with_context(|| format!("copying {}", from.display()))?;
+        Ok(())
+    }
+}
+
+/// The contract under test, read after undoing an older version's interrupted run.
+#[derive(Debug)]
 pub(crate) struct Target {
-    pub(crate) abs: PathBuf,
+    /// The path as given, relative to the project: the same in a [`Sandbox`].
+    pub(crate) rel: PathBuf,
     pub(crate) source: String,
     pub(crate) name: String,
 }
@@ -109,7 +178,25 @@ impl Target {
         let abs = repo.join(contract);
         let backup = backup_path(&abs);
         if backup.exists() {
-            // A previous run was killed mid-mutation: the contract on disk is a mutant.
+            let original = fs::read_to_string(&backup)
+                .with_context(|| format!("reading {}", backup.display()))?;
+            let current =
+                fs::read_to_string(&abs).with_context(|| format!("reading {}", abs.display()))?;
+            // Put the original back only over the original or one of its mutants:
+            // anything else is an edit made since, and stays.
+            let untouched = current == original
+                || mutate::mutants(&original, usize::MAX)
+                    .iter()
+                    .any(|m| m.source == current);
+            if !untouched {
+                bail!(
+                    "{} has a backup from an interrupted run of an older ausweg, {}, and the \
+                     file has changed since that run: compare the two, keep the one you want, \
+                     and delete the backup",
+                    contract.display(),
+                    backup.display()
+                );
+            }
             fs::rename(&backup, &abs).with_context(|| {
                 format!("restoring {} from {}", abs.display(), backup.display())
             })?;
@@ -122,7 +209,11 @@ impl Target {
             .and_then(|s| s.to_str())
             .context("contract path has no file name")?
             .to_string();
-        Ok(Self { abs, source, name })
+        Ok(Self {
+            rel: contract.to_path_buf(),
+            source,
+            name,
+        })
     }
 }
 
@@ -251,18 +342,14 @@ pub(crate) fn score(
     opts: &Options,
 ) -> Result<MutationScore> {
     let ms = mutate::mutants(&target.source, opts.max_mutants);
-    let backup = backup_path(&target.abs);
-    fs::write(&backup, &target.source)?;
-    let _restore = Restore {
-        path: &target.abs,
-        backup: &backup,
-        original: &target.source,
-    };
+    // Mutants go to a copy of the project: the contract itself is never edited.
+    let sandbox = Sandbox::new(repo)?;
+    let file = sandbox.root.join(&target.rel);
 
     let mut detail = Vec::with_capacity(ms.len());
     for m in &ms {
-        fs::write(&target.abs, &m.source)?;
-        let r = forge.test(repo, test_file)?;
+        fs::write(&file, &m.source)?;
+        let r = forge.test(&sandbox.root, test_file)?;
         // Only tests that passed on clean code count. A test that already failed
         // would otherwise "catch" every mutant.
         let caught: Vec<_> = r
@@ -322,7 +409,10 @@ mod tests {
     /// - testFuzz_broken fails an assertion on clean code, so it must never count.
     struct FakeForge {
         fail_builds: Cell<usize>,
+        /// The user's own copy of the contract: no test run may see it changed.
         contract: PathBuf,
+        /// Test runs in a project other than the user's: the sandbox.
+        elsewhere: Cell<usize>,
     }
     impl Forge for FakeForge {
         fn build(&self, _: &Path) -> Result<BuildResult> {
@@ -339,8 +429,14 @@ mod tests {
                 output: String::new(),
             })
         }
-        fn test(&self, _: &Path, _: &str) -> Result<TestResult> {
-            let src = fs::read_to_string(&self.contract)?;
+        fn test(&self, repo: &Path, _: &str) -> Result<TestResult> {
+            // The user's file is never a mutant, whichever project the tests run in.
+            assert_eq!(fs::read_to_string(&self.contract)?, VAULT);
+            let user_repo = self.contract.parent().unwrap().parent().unwrap();
+            if fs::canonicalize(repo)? != fs::canonicalize(user_repo)? {
+                self.elsewhere.set(self.elsewhere.get() + 1);
+            }
+            let src = fs::read_to_string(repo.join("src/Vault.sol"))?;
             let mut r = TestResult {
                 ran: true,
                 ..Default::default()
@@ -392,7 +488,91 @@ mod tests {
         FakeForge {
             fail_builds: Cell::new(fail_builds),
             contract: dir.path().join("src/Vault.sol"),
+            elsewhere: Cell::new(0),
         }
+    }
+
+    #[test]
+    fn mutants_run_in_a_copy_and_the_contract_is_never_edited() {
+        let dir = setup();
+        fs::create_dir_all(dir.path().join("test")).unwrap();
+        fs::write(dir.path().join("test/Mine.t.sol"), "contract Mine {}").unwrap();
+        let f = forge(&dir, 0);
+        let r = score_existing(
+            dir.path(),
+            Path::new("src/Vault.sol"),
+            Path::new("test/Mine.t.sol"),
+            &f,
+            &opts(),
+        )
+        .unwrap();
+        // The clean run is in the project; both mutants ran in the copy, and
+        // the fake checked before each run that the contract was untouched.
+        assert_eq!(r.mutation.unwrap().mutants, 2);
+        assert_eq!(f.elsewhere.get(), 2);
+        assert!(!dir.path().join("src/Vault.sol.ausweg-backup").exists());
+    }
+
+    #[test]
+    fn the_copy_links_dependencies_and_removing_it_keeps_them() {
+        let dir = setup();
+        let p = dir.path();
+        fs::create_dir_all(p.join("lib/dep/src")).unwrap();
+        fs::write(p.join("lib/dep/src/D.sol"), "contract D {}").unwrap();
+        fs::create_dir_all(p.join("test/generated")).unwrap();
+        fs::write(p.join("test/generated/V.proof.t.sol"), "contract P {}").unwrap();
+        fs::write(p.join("foundry.toml"), "[profile.default]\n").unwrap();
+        for d in [".git", "out", "cache"] {
+            fs::create_dir_all(p.join(d)).unwrap();
+            fs::write(p.join(d).join("x"), "x").unwrap();
+        }
+        let root = {
+            let s = Sandbox::new(p).unwrap();
+            let root = s.root.clone();
+            assert_eq!(
+                fs::read_to_string(root.join("src/Vault.sol")).unwrap(),
+                VAULT
+            );
+            assert!(root.join("test/generated/V.proof.t.sol").is_file());
+            assert!(root.join("foundry.toml").is_file());
+            assert!(
+                fs::symlink_metadata(root.join("lib"))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert!(root.join("lib/dep/src/D.sol").is_file());
+            for d in [".git", "out", "cache"] {
+                assert!(!root.join(d).exists(), "{d} copied");
+            }
+            // A mutant in the copy leaves the project alone.
+            fs::write(root.join("src/Vault.sol"), "mutant").unwrap();
+            assert_eq!(fs::read_to_string(p.join("src/Vault.sol")).unwrap(), VAULT);
+            root
+        };
+        assert!(!root.exists(), "copy not removed");
+        assert_eq!(
+            fs::read_to_string(p.join("lib/dep/src/D.sol")).unwrap(),
+            "contract D {}"
+        );
+    }
+
+    #[test]
+    fn an_old_backup_never_overwrites_an_edited_contract() {
+        let dir = setup();
+        let contract = dir.path().join("src/Vault.sol");
+        let backup = dir.path().join("src/Vault.sol.ausweg-backup");
+        // An older ausweg was interrupted, and then the user edited the contract.
+        let edited = VAULT.replace(
+            "uint public total;",
+            "uint public total;\n    uint public fee;",
+        );
+        fs::write(&contract, &edited).unwrap();
+        fs::write(&backup, VAULT).unwrap();
+        let err = Target::open(dir.path(), Path::new("src/Vault.sol")).unwrap_err();
+        assert!(err.to_string().contains("changed since that run"), "{err}");
+        assert_eq!(fs::read_to_string(&contract).unwrap(), edited);
+        assert!(backup.exists());
     }
 
     #[test]

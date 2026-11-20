@@ -283,7 +283,7 @@ Large contracts: Ollama drops the start of a prompt longer than its context wind
 1. Prompt the model with the contract and two example properties.
 2. Write `test/generated/<Name>.base.t.sol` and run `forge build`. If it fails, send the errors back and retry.
 3. Run `forge test --match-path` on the unchanged contract.
-4. Mutate the contract one spot at a time, rerun the tests, then restore the original. While mutating, the original is also kept in `<Name>.sol.ausweg-backup`. If a run is killed, the next run restores the contract from it.
+4. Mutate the contract one spot at a time and rerun the tests. Since 0.6.4 the mutants go to a copy of the project in the system temp directory, with `lib/` linked rather than copied, so your contract is never edited: a run stopped with Ctrl-C leaves its copy in the temp directory, not a mutant in `src/`. Before, ausweg wrote each mutant over the contract and kept the original in `<Name>.sol.ausweg-backup`. If it finds such a backup, it puts the original back only when the file on disk is the original or one of its mutants; if you have edited the file since, it stops and leaves both for you to compare.
 
 `ausweg invariants`:
 

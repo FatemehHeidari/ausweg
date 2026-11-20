@@ -18,7 +18,7 @@
 //! `totalAssets() >= totalSupply()`.
 
 use crate::abi::{Abi, Item, Param};
-use crate::baseline::{Restore, Target, backup_path};
+use crate::baseline::{Sandbox, Target};
 use crate::forge::Forge;
 use crate::mutate;
 use crate::plan::{self, CtorValue};
@@ -1134,13 +1134,9 @@ fn score(
     opts: &ProveOptions,
 ) -> Result<ProofMutation> {
     let ms = mutate::mutants(&target.source, opts.max_mutants);
-    let backup = backup_path(&target.abs);
-    fs::write(&backup, &target.source)?;
-    let _restore = Restore {
-        path: &target.abs,
-        backup: &backup,
-        original: &target.source,
-    };
+    // Mutants go to a copy of the project: the vault itself is never edited.
+    let sandbox = Sandbox::new(repo)?;
+    let file = sandbox.root.join(&target.rel);
     let mut detail = Vec::with_capacity(ms.len());
     for (k, m) in ms.iter().enumerate() {
         eprintln!(
@@ -1150,8 +1146,8 @@ fn score(
             m.line,
             m.change
         );
-        fs::write(&target.abs, &m.source)?;
-        let (checks, _) = run_halmos(repo, proof_contract, opts, true)?;
+        fs::write(&file, &m.source)?;
+        let (checks, _) = run_halmos(&sandbox.root, proof_contract, opts, true)?;
         let (outcome, caught_by, timed_out) = match checks {
             None => (ProofOutcome::Invalid, Vec::new(), Vec::new()),
             Some(checks) => {
