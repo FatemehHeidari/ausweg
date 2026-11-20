@@ -6,8 +6,9 @@
 //! - init: a fresh deployment satisfies the invariant;
 //! - keeps: from any state that satisfies it, every state-changing call, by any
 //!   user with any arguments, leads to a state that satisfies it;
-//! - exit: from any state that satisfies it, each user can redeem all their
-//!   shares, and withdraw all their assets, and gets what the previews promise.
+//! - exit: from any state that satisfies it, each user can redeem every share
+//!   they hold, with none left, and withdraw what `maxWithdraw` quotes, and gets
+//!   what the previews promise. A preview or max view that reverts is a failure.
 //!
 //! All three proved means: from every reachable state, every user can get out.
 //!
@@ -382,7 +383,9 @@ pragma solidity ^0.8.0;
 //
 // check_init: a fresh deployment satisfies the invariant.
 // check_keeps_*: every state-changing call keeps it, for any caller and arguments.
-// check_exit_*: from any state that satisfies it, each user can take everything out.
+// check_exit_redeem: from any state that satisfies it, each user redeems every
+// share they hold. check_exit_withdraw: each user withdraws what maxWithdraw
+// quotes. A preview or max view that reverts fails the check.
 
 import {{Test}} from "forge-std/Test.sol";
 import "{import_path}";
@@ -488,36 +491,55 @@ contract {c}Proof is Test {{
         assert(_holds());
     }}
 
-    /// From any state that satisfies the invariant, user i redeems everything.
+    /// From any state that satisfies the invariant, user i redeems every share
+    /// they hold, not just what maxRedeem quotes, and keeps none.
     function check_exit_redeem(uint256 i) public {{
         vm.assume(i < 3);
         address u = _user(i);
         vm.assume(_inv());
         _witness();
-        vm.assume(target.balanceOf(u) == svm.createUint256("userShares"));
-        uint256 shares = target.maxRedeem(u);
+        uint256 shares = target.balanceOf(u);
+        vm.assume(shares == svm.createUint256("userShares"));
         vm.assume(shares > 0);
-        uint256 promised = target.previewRedeem(shares);
+        // A revert here would drop the state from the check: count it as a failure.
+        uint256 promised;
+        try target.previewRedeem(shares) returns (uint256 p) {{
+            promised = p;
+        }} catch {{
+            assert(false);
+        }}
         uint256 before = asset.balanceOf(u);
         vm.prank(u);
         try target.redeem(shares, u, u) returns (uint256 paid) {{
             assert(paid >= promised);
             assert(asset.balanceOf(u) == before + paid);
+            assert(target.balanceOf(u) == 0);
         }} catch {{
             assert(false);
         }}
     }}
 
-    /// From any state that satisfies the invariant, user i withdraws everything.
+    /// From any state that satisfies the invariant, user i withdraws what
+    /// maxWithdraw quotes.
     function check_exit_withdraw(uint256 i) public {{
         vm.assume(i < 3);
         address u = _user(i);
         vm.assume(_inv());
         _witness();
         vm.assume(target.balanceOf(u) == svm.createUint256("userShares"));
-        uint256 assets = target.maxWithdraw(u);
+        uint256 assets;
+        try target.maxWithdraw(u) returns (uint256 a) {{
+            assets = a;
+        }} catch {{
+            assert(false);
+        }}
         vm.assume(assets > 0);
-        uint256 cost = target.previewWithdraw(assets);
+        uint256 cost;
+        try target.previewWithdraw(assets) returns (uint256 c) {{
+            cost = c;
+        }} catch {{
+            assert(false);
+        }}
         uint256 sharesBefore = target.balanceOf(u);
         uint256 before = asset.balanceOf(u);
         vm.prank(u);
@@ -1365,6 +1387,24 @@ mod tests {
             p.source
                 .contains("vm.assume(callerI < 3 && assets <= MAX_AMOUNT && receiverI < 3);")
         );
+    }
+
+    #[test]
+    fn exit_redeem_takes_the_whole_position() {
+        let abi = Abi::parse(OZ_VAULT_ABI).unwrap();
+        let p = render("OZVault", "../../src/OZVault.sol", &abi, true, false).unwrap();
+        // Every share the user holds, not what maxRedeem quotes, and none left.
+        assert!(p.source.contains("uint256 shares = target.balanceOf(u);"));
+        assert!(!p.source.contains("target.maxRedeem(u)"));
+        assert!(p.source.contains("assert(target.balanceOf(u) == 0);"));
+        // A view that reverts fails the check instead of dropping the state.
+        for view in [
+            "try target.previewRedeem(shares) returns (uint256 p) {",
+            "try target.maxWithdraw(u) returns (uint256 a) {",
+            "try target.previewWithdraw(assets) returns (uint256 c) {",
+        ] {
+            assert!(p.source.contains(view), "{view}");
+        }
     }
 
     #[test]

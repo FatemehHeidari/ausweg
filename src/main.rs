@@ -551,7 +551,7 @@ fn print_proof_summary(r: &prove::ProveReport) {
     if r.liquidity_proved {
         match &r.exit {
             None => println!(
-                "- liquidity: proved: from every reachable state of the three-user world, every user can redeem and withdraw everything"
+                "- liquidity: proved: from every reachable state of the three-user world, every user can redeem every share they hold, and withdraw what maxWithdraw quotes"
             ),
             Some(e) => println!(
                 "- liquidity: proved: from every reachable state of the three-user world, every user can get out in three steps{}; no other user, and not the owner, can shrink a request or lower the share price",

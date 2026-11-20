@@ -219,13 +219,13 @@ const EXIT_CHECKS_SOURCE: &str = r#"
     // user can take everything out, one after another. Each check runs in a
     // snapshot that is rolled back, so the campaign continues unchanged.
 
-    /// ausweg: alice, bob and carol can each redeem maxRedeem, one after another
+    /// ausweg: alice, bob and carol can each redeem every share they hold, one after another
     function invariant_ausweg_exit_redeem() public {
         uint256 snap = vm.snapshotState();
         address[3] memory exiting = [alice, bob, carol];
         for (uint256 i; i < exiting.length; i++) {
             address u = exiting[i];
-            uint256 shares = target.maxRedeem(u);
+            uint256 shares = target.balanceOf(u);
             if (shares == 0) continue;
             uint256 promised = target.previewRedeem(shares);
             uint256 before = AuswegToken(address(target.asset())).balanceOf(u);
@@ -233,8 +233,9 @@ const EXIT_CHECKS_SOURCE: &str = r#"
             try target.redeem(shares, u, u) returns (uint256 paid) {
                 assertGe(paid, promised, "ausweg exit: redeem paid less than previewRedeem");
                 assertEq(AuswegToken(address(target.asset())).balanceOf(u), before + paid, "ausweg exit: redeem transferred a different amount");
+                assertEq(target.balanceOf(u), 0, "ausweg exit: redeem left shares behind");
             } catch {
-                assertTrue(false, "ausweg exit: redeem(maxRedeem) reverted");
+                assertTrue(false, "ausweg exit: redeem(balanceOf) reverted");
             }
         }
         vm.revertToStateAndDelete(snap);
@@ -610,6 +611,12 @@ mod tests {
                 .contains("try target.withdraw(assets, u, u) returns (uint256 burned) {")
         );
         assert!(sc.source.contains("AuswegToken(address(target.asset()))"));
+        // The bank run redeems every share each user holds, not maxRedeem's quote.
+        assert!(sc.source.contains("uint256 shares = target.balanceOf(u);"));
+        assert!(
+            sc.source
+                .contains("\"ausweg exit: redeem left shares behind\"")
+        );
         // Every failure message is marked, so the scorer counts it as an assertion.
         let section = &sc.source[sc.source.find("// Exit checks, written by ausweg").unwrap()..];
         let calls: Vec<&str> = section
@@ -620,7 +627,7 @@ mod tests {
                     .any(|a| l.contains(a))
             })
             .collect();
-        assert_eq!(calls.len(), 7);
+        assert_eq!(calls.len(), 8);
         for line in calls {
             assert!(line.contains("\"ausweg exit: "), "unmarked: {line}");
         }
