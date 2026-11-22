@@ -16,6 +16,13 @@
 //! unknown words, a shift by an unknown amount); they become uninterpreted
 //! functions. Then an `unsat` answer still holds, and a `sat` answer goes to a
 //! bit-vector solver, since its model may not be a real one.
+//!
+//! Exactness is a claim about this code, so since 0.8.0 (Step 17) answers are
+//! checked against the original query. Every `sat` model is plugged back into
+//! it, and Halmos gets only a model that checks out; a sample of the rewrite's
+//! `unsat` answers, or all of them, goes to a bit-vector solver. A
+//! disagreement is saved, and Halmos gets the bit-vector answer once its model
+//! checks out, or `unknown`.
 
 use anyhow::{Context, Result, anyhow, bail};
 use num_bigint::BigUint;
@@ -24,7 +31,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------- S-expressions
 
@@ -1079,7 +1086,7 @@ fn translate(g: &Graph) -> Translation {
                         let hi: BigUint = n.args.iter().map(|&x| ranges[x].hi.clone()).sum();
                         let lo: BigUint = n.args.iter().map(|&x| ranges[x].lo.clone()).sum();
                         let s = call("+", &n.args, &exprs);
-                        if hi < m {
+                        if hi < m || injected("wraparound") {
                             (s, Range { lo, hi })
                         } else {
                             wrap = true;
@@ -1315,7 +1322,7 @@ fn translate(g: &Graph) -> Translation {
                     "(assert (and (<= 0 {name}) (<= {name} {})))",
                     pow2(*w) - 1u32
                 );
-                if name.starts_with("p_") || name.starts_with("halmos_") {
+                if is_halmos_name(name) {
                     model_vars.push((name.clone(), *w));
                 }
             }
@@ -1691,6 +1698,34 @@ fn run(cmd: &[String], file: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Runs a checker, stopping it and everything it started at `deadline`,
+/// whatever its own time limit says. None if it was stopped.
+fn run_until(cmd: &[String], file: &Path, deadline: Instant) -> Result<Option<String>> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let mut c = Command::new(&cmd[0]);
+    c.args(&cmd[1..])
+        .arg(file)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    // A checker may be a script around the real solver: run it in a group of
+    // its own, so stopping it stops the solver too.
+    crate::prove::own_group(&mut c);
+    let mut child = c.spawn().with_context(|| format!("running {}", cmd[0]))?;
+    let mut stdout = child.stdout.take().context("reading the checker")?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut out = Vec::new();
+        let _ = stdout.read_to_end(&mut out);
+        let _ = tx.send(out);
+    });
+    let out = rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+    // Finished or not, it stops here, with every process it started.
+    crate::prove::stop_group(&mut child);
+    Ok(out.ok().map(|o| String::from_utf8_lossy(&o).into_owned()))
+}
+
 fn parse_values(out: &str, vars: &[(String, u32)]) -> Option<Vec<(String, u32, BigUint)>> {
     let rest = out.trim_start().strip_prefix("sat")?;
     let sexps = parse_sexps(rest).ok()?;
@@ -1701,20 +1736,120 @@ fn parse_values(out: &str, vars: &[(String, u32)]) -> Option<Vec<(String, u32, B
                 && let Some(a) = v.atom()
                 && let Some(n) = BigUint::parse_bytes(a.as_bytes(), 10)
             {
-                vals.insert(name.clone(), n);
+                vals.insert(plain(name).to_string(), n);
             }
         }
     }
     Some(
         vars.iter()
-            .map(|(n, w)| (n.clone(), *w, vals.get(n).cloned().unwrap_or_default()))
+            .map(|(n, w)| {
+                let v = vals.get(plain(n)).cloned().unwrap_or_default();
+                (n.clone(), *w, v)
+            })
             .collect(),
     )
 }
 
-/// Solves a Halmos query file. Returns the answer and, for the fallback, the
-/// bit-vector solver's own output to pass through.
+/// Where an answer came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum By {
+    /// The integer rewrite.
+    Rewrite,
+    /// A bit-vector solver on the original query.
+    BitVector,
+}
+
+/// An answer, before Step 17's checks.
+struct Outcome {
+    answer: Answer,
+    /// For a bit-vector solver's answer, its output, passed to Halmos as is.
+    passthrough: Option<String>,
+    by: By,
+    /// The integer solver's output, when the rewrite answered.
+    rewrite_out: Option<String>,
+    /// How the solver that answered was run.
+    run: Option<SolverRun>,
+}
+
+struct SolverRun {
+    command: Vec<String>,
+    /// The query it read.
+    input: PathBuf,
+    budget: Duration,
+    took: Duration,
+}
+
+/// A bit-vector solver's answer to the original query, its output, and the
+/// command.
+fn bit_vector(
+    file: &Path,
+    budget: Duration,
+    incremental: bool,
+) -> Result<(Answer, Option<String>, Option<Vec<String>>)> {
+    match bv_solver(budget, incremental) {
+        Some(cmd) => {
+            let mut out = run(&cmd, file)?;
+            if injected("bad-fallback-model") {
+                out = corrupt_values(&out);
+            }
+            let a = match first_line(&out) {
+                "unsat" => Answer::Unsat,
+                "sat" => Answer::Sat(Vec::new()),
+                _ => Answer::Unknown,
+            };
+            Ok((a, Some(out), Some(cmd)))
+        }
+        None => Ok((Answer::Unknown, None, None)),
+    }
+}
+
+fn first_line(out: &str) -> &str {
+    out.lines().next().unwrap_or("").trim()
+}
+
+/// Solves a Halmos query file, then checks the answer (Step 17). Returns the
+/// answer and, for a bit-vector solver's answer, its own output to pass on.
 pub fn solve(file: &Path, timeout: Duration) -> Result<(Answer, Option<String>)> {
+    let mode = CheckMode::from_env();
+    let deadline = Instant::now() + timeout;
+    let o = solve_unchecked(file, timeout)?;
+    // The checks of an answer share at most `AUSWEG_CHECK_TIMEOUT` seconds (10
+    // by default), within the query's time: the checker is a bit-blasting
+    // solver, slow on exactly the queries the rewrite is for, and an
+    // inconclusive check costs what it was given.
+    let cap = Duration::from_secs(
+        std::env::var("AUSWEG_CHECK_TIMEOUT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10),
+    );
+    let src = std::fs::read_to_string(file).unwrap_or_default();
+    let mut rec = Record {
+        query: format!("{:016x}", fnv1a(0, &src)),
+        by: match o.by {
+            By::Rewrite => "rewrite",
+            By::BitVector => "bit-vector",
+        }
+        .into(),
+        check: "none".into(),
+        ..Default::default()
+    };
+    let (answer, passthrough) = if mode == CheckMode::Off {
+        (o.answer, o.passthrough)
+    } else {
+        checked(file, &src, mode, o, timeout, cap, deadline, &mut rec)?
+    };
+    rec.answer = match &answer {
+        Answer::Unsat => "unsat",
+        Answer::Sat(_) => "sat",
+        Answer::Unknown => "unknown",
+    }
+    .into();
+    record(&rec);
+    Ok((answer, passthrough))
+}
+
+fn solve_unchecked(file: &Path, timeout: Duration) -> Result<Outcome> {
     let src =
         std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
     let cmds = parse_sexps(&src);
@@ -1727,36 +1862,42 @@ pub fn solve(file: &Path, timeout: Duration) -> Result<(Answer, Option<String>)>
         Ok(translate(&g))
     });
     // Every solver call shares one budget, so Halmos never has to kill us.
-    let deadline = std::time::Instant::now() + timeout;
+    let deadline = Instant::now() + timeout;
     let remaining = || {
         deadline
-            .saturating_duration_since(std::time::Instant::now())
+            .saturating_duration_since(Instant::now())
             .max(Duration::from_secs(1))
     };
-    let fallback = |reason: &str| -> Result<(Answer, Option<String>)> {
-        let _ = reason;
-        match bv_solver(remaining(), incremental) {
-            Some(cmd) => {
-                let out = run(&cmd, file)?;
-                let first = out.lines().next().unwrap_or("").trim();
-                let a = match first {
-                    "unsat" => Answer::Unsat,
-                    "sat" => Answer::Sat(Vec::new()),
-                    _ => Answer::Unknown,
-                };
-                Ok((a, Some(out)))
-            }
-            None => Ok((Answer::Unknown, None)),
-        }
+    let fallback = || -> Result<Outcome> {
+        let (budget, started) = (remaining(), Instant::now());
+        let (answer, passthrough, command) = bit_vector(file, budget, incremental)?;
+        Ok(Outcome {
+            answer,
+            passthrough,
+            by: By::BitVector,
+            rewrite_out: None,
+            run: command.map(|command| SolverRun {
+                command,
+                input: file.to_path_buf(),
+                budget,
+                took: started.elapsed(),
+            }),
+        })
     };
-    let t = match translated {
-        Ok(t) => t,
-        Err(e) => return fallback(&e.to_string()),
+    let rewrite = |answer: Answer, out: String, run: SolverRun| Outcome {
+        answer,
+        passthrough: None,
+        by: By::Rewrite,
+        rewrite_out: Some(out),
+        run: Some(run),
+    };
+    let Ok(t) = translated else {
+        return fallback();
     };
     let int_file = file.with_extension("int.smt2");
     std::fs::write(&int_file, &t.script)?;
     if int_solver(timeout).is_none() {
-        return fallback("no integer solver (install z3)");
+        return fallback();
     }
     // Paths through code ausweg abstracts (OpenZeppelin's 512-bit mulDiv branch)
     // are usually infeasible for reasons that do not need that code: try the
@@ -1765,26 +1906,969 @@ pub fn solve(file: &Path, timeout: Duration) -> Result<(Answer, Option<String>)>
         let quick = Duration::from_secs((timeout.as_secs() / 3).max(1));
         let rel_file = file.with_extension("relaxed.smt2");
         std::fs::write(&rel_file, staged(relaxed, quick))?;
-        let out = run(&int_solver(quick).unwrap(), &rel_file)?;
-        if out.lines().next().map(str::trim) == Some("unsat") {
-            return Ok((Answer::Unsat, None));
+        let (command, started) = (int_solver(quick).unwrap(), Instant::now());
+        let out = run(&command, &rel_file)?;
+        if first_line(&out) == "unsat" {
+            let took = started.elapsed();
+            let input = rel_file.clone();
+            let solved = SolverRun {
+                command,
+                input,
+                budget: quick,
+                took,
+            };
+            return Ok(rewrite(Answer::Unsat, out, solved));
         }
     }
     let left = remaining();
     std::fs::write(&int_file, staged(&t.script, left))?;
-    let out = run(&int_solver(left).unwrap(), &int_file)?;
-    let first = out.lines().next().unwrap_or("").trim().to_string();
-    match first.as_str() {
-        "unsat" => Ok((Answer::Unsat, None)),
+    let (command, started) = (int_solver(left).unwrap(), Instant::now());
+    let out = run(&command, &int_file)?;
+    let took = started.elapsed();
+    let solved = SolverRun {
+        command,
+        input: int_file.clone(),
+        budget: left,
+        took,
+    };
+    match first_line(&out) {
+        "unsat" => Ok(rewrite(Answer::Unsat, out, solved)),
         "sat" if !t.abstracted => match parse_values(&out, &t.model_vars) {
-            Some(v) => Ok((Answer::Sat(v), None)),
-            None => fallback("unreadable model"),
+            Some(mut v) => {
+                if injected("bad-model") {
+                    for (_, w, x) in v.iter_mut() {
+                        *x = (&*x + 1u32) % pow2(*w);
+                    }
+                }
+                Ok(rewrite(Answer::Sat(v), out, solved))
+            }
+            None => fallback(),
         },
         // The model may use an abstracted operation wrongly: let a bit-vector
         // solver decide.
-        "sat" => fallback("sat with abstractions"),
+        "sat" => fallback(),
         // Out of time: a bit-vector solver would not do better.
-        _ => Ok((Answer::Unknown, None)),
+        _ => Ok(rewrite(Answer::Unknown, out, solved)),
+    }
+}
+
+// ---------------------------------------------------------------- Step 17: checking answers
+
+/// Which answers to check against the original bit-vector query.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckMode {
+    /// No checks.
+    Off,
+    /// Every `sat` model, and the rewrite's `unsat` answers that a keyed hash
+    /// of the query picks: one in `every`, the same ones whenever the seed is
+    /// the same. An `unsat` the check cannot settle stays `unsat`.
+    Sample { every: u64, seed: u64 },
+    /// Every `sat` model and every `unsat` from the rewrite. An `unsat` the
+    /// check cannot settle becomes `unknown`.
+    All,
+}
+
+impl CheckMode {
+    pub const DEFAULT: CheckMode = CheckMode::Sample { every: 16, seed: 0 };
+
+    /// The value of `AUSWEG_CHECK`, which `ausweg prove` passes to `ausweg smt`.
+    pub fn to_env(self) -> String {
+        match self {
+            CheckMode::Off => "off".into(),
+            CheckMode::All => "all".into(),
+            CheckMode::Sample { every, seed } => format!("sample:{every}:{seed}"),
+        }
+    }
+
+    pub fn from_env_value(v: &str) -> Option<CheckMode> {
+        match v {
+            "off" => Some(CheckMode::Off),
+            "all" => Some(CheckMode::All),
+            _ => {
+                let mut parts = v.strip_prefix("sample:")?.split(':');
+                let every = parts.next()?.parse().ok().filter(|&e: &u64| e > 0)?;
+                let seed = parts.next()?.parse().ok()?;
+                parts
+                    .next()
+                    .is_none()
+                    .then_some(CheckMode::Sample { every, seed })
+            }
+        }
+    }
+
+    fn from_env() -> CheckMode {
+        std::env::var("AUSWEG_CHECK")
+            .ok()
+            .and_then(|v| Self::from_env_value(&v))
+            .unwrap_or(Self::DEFAULT)
+    }
+
+    /// Whether to check the rewrite's `unsat` answer to this query.
+    fn picks(self, query: &str) -> bool {
+        match self {
+            CheckMode::Off => false,
+            CheckMode::All => true,
+            CheckMode::Sample { every, seed } => {
+                let h = fnv1a(seed, query);
+                (h ^ (h >> 32)).is_multiple_of(every)
+            }
+        }
+    }
+
+    pub fn describe(self) -> String {
+        match self {
+            CheckMode::Off => "off".into(),
+            CheckMode::All => "every answer".into(),
+            CheckMode::Sample { every, seed } => format!("1 in {every}, seed {seed}"),
+        }
+    }
+}
+
+/// 64-bit FNV-1a over the seed and the query, with Halmos's per-run symbol ids
+/// left out: the same query hashes the same on every run, machine and build.
+fn fnv1a(seed: u64, text: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in seed
+        .to_le_bytes()
+        .iter()
+        .chain(without_run_ids(text).as_bytes())
+    {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// The query without the random part of Halmos's symbol names: Halmos names a
+/// symbol `p_x_uint256_<7 hex digits>_00`, the digits fresh on every run.
+fn without_run_ids(text: &str) -> String {
+    let b = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < b.len() {
+        let id = b[i] == b'_'
+            && i + 10 <= b.len()
+            && b[i + 1..i + 8]
+                .iter()
+                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(c))
+            && b[i + 8] == b'_'
+            && b[i + 9].is_ascii_digit();
+        if id {
+            i += 8;
+        } else {
+            out.push(b[i] as char);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Faults to plant, for testing the checks: `AUSWEG_SMT_INJECT`, a comma-separated
+/// list of `wraparound` (a sum that can overflow loses its `mod 2^n`), `bad-model`
+/// (every value in the rewrite's model is changed) and `bad-fallback-model` (so
+/// is every value in the bit-vector solver's). Only in builds with the `fault-injection` feature.
+fn injected(fault: &str) -> bool {
+    #[cfg(feature = "fault-injection")]
+    {
+        std::env::var("AUSWEG_SMT_INJECT").is_ok_and(|v| v.split(',').any(|f| f.trim() == fault))
+    }
+    #[cfg(not(feature = "fault-injection"))]
+    {
+        let _ = fault;
+        false
+    }
+}
+
+/// The solver output with every value Halmos reads changed: `(_ bvK n)` becomes
+/// `(_ bvK+1 n)`, mod 2^n, and a `#x`/`#b` literal gets its last digit changed.
+fn corrupt_values(out: &str) -> String {
+    let change = |line: &str| -> String {
+        let reads = [
+            "(define-fun p_",
+            "(define-fun halmos_",
+            "(define-fun |p_",
+            "(define-fun |halmos_",
+        ];
+        if !reads.iter().any(|r| line.contains(r)) {
+            return line.to_string();
+        }
+        if let Some(i) = line.find("(_ bv") {
+            let digits: String = line[i + 5..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            let tail = &line[i + 5 + digits.len()..];
+            let width: u32 = tail
+                .trim_start()
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+                .parse()
+                .unwrap_or(256);
+            let k: BigUint = digits.parse().unwrap_or_default();
+            format!("{}(_ bv{}{tail}", &line[..i], (k + 1u32) % pow2(width))
+        } else if let Some(i) = line.rfind(|c: char| c.is_ascii_hexdigit()) {
+            let c = line.as_bytes()[i] as char;
+            let flipped = if c == '0' { '1' } else { '0' };
+            format!("{}{flipped}{}", &line[..i], &line[i + 1..])
+        } else {
+            line.to_string()
+        }
+    };
+    let mut s: String = out.lines().map(change).collect::<Vec<_>>().join("\n");
+    if out.ends_with('\n') {
+        s.push('\n');
+    }
+    s
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A checker command for this test thread only.
+    static TEST_CHECKER: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
+    /// Where this test thread saves disagreements.
+    static TEST_SAVE_DIR: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The bit-vector solver that checks answers: `AUSWEG_SMT_CHECKER`, else yices,
+/// else bitwuzla, else z3.
+fn checker(budget: Duration) -> Option<Vec<String>> {
+    #[cfg(test)]
+    if let Some(c) = TEST_CHECKER.with(|c| c.borrow().clone()) {
+        return Some(c);
+    }
+    if let Ok(cmd) = std::env::var("AUSWEG_SMT_CHECKER") {
+        return Some(cmd.split_whitespace().map(String::from).collect());
+    }
+    // Its own limit, in whole seconds, is rounded up: `run_until` stops it on
+    // time.
+    let secs = (budget.as_millis().div_ceil(1000) as u64).max(1);
+    if let Some(y) = find_on_path("yices-smt2").or_else(|| halmos_solver("yices-smt2")) {
+        return Some(yices(&y, secs, false));
+    }
+    if let Some(b) = find_on_path("bitwuzla").or_else(|| halmos_solver("bitwuzla")) {
+        return Some(vec![
+            b.display().to_string(),
+            "--produce-models".into(),
+            format!("--time-limit={}", secs * 1000),
+        ]);
+    }
+    let z3 = find_on_path("z3")?;
+    Some(vec![
+        z3.display().to_string(),
+        "-smt2".into(),
+        format!("-T:{secs}"),
+    ])
+}
+
+/// A symbol without its `|...|` quotes.
+fn plain(sym: &str) -> &str {
+    sym.strip_prefix('|')
+        .and_then(|s| s.strip_suffix('|'))
+        .unwrap_or(sym)
+}
+
+/// A name Halmos reads back from a model, by its pattern
+/// `\|?((?:halmos_|p_)[^ |]+)\|?`: `halmos_*` or `p_*`, quoted or not.
+fn is_halmos_name(sym: &str) -> bool {
+    let p = plain(sym);
+    p.strip_prefix("halmos_")
+        .or_else(|| p.strip_prefix("p_"))
+        .is_some_and(|rest| !rest.is_empty() && !rest.contains([' ', '|']))
+}
+
+/// Model values the way Halmos reads them: `(define-fun <halmos_* or p_*> ()
+/// (_ BitVec n) v)`, the name possibly in `|...|`, with v a `#x` or `#b`
+/// literal or `(_ bvK n)`. Names come back without quotes.
+fn read_model(out: &str) -> Vec<(String, u32, BigUint)> {
+    fn walk(s: &Sexp, acc: &mut Vec<(String, u32, BigUint)>) {
+        let Some(l) = s.list() else { return };
+        if let [Sexp::Atom(df), Sexp::Atom(name), Sexp::List(ps), sort, v] = l
+            && df == "define-fun"
+            && ps.is_empty()
+            && is_halmos_name(name)
+            && let Some([Sexp::Atom(u), Sexp::Atom(bv), Sexp::Atom(w)]) = sort.list()
+            && u == "_"
+            && bv == "BitVec"
+            && let Ok(w) = w.parse::<u32>()
+        {
+            let value = match v {
+                Sexp::Atom(a) => parse_literal(a).map(|(x, _)| x),
+                Sexp::List(t) => match t.as_slice() {
+                    [Sexp::Atom(u), Sexp::Atom(k), Sexp::Atom(_)] if u == "_" => {
+                        k.strip_prefix("bv").and_then(|d| d.parse().ok())
+                    }
+                    _ => None,
+                },
+            };
+            if let Some(x) = value {
+                acc.push((plain(name).to_string(), w, x));
+            }
+            return;
+        }
+        for c in l {
+            walk(c, acc);
+        }
+    }
+    let mut acc = Vec::new();
+    let body = out.trim_start().strip_prefix("sat").unwrap_or(out);
+    for s in parse_sexps(body).unwrap_or_default() {
+        walk(&s, &mut acc);
+    }
+    acc
+}
+
+/// The Halmos bit-vector variables a query declares: (name without quotes,
+/// the symbol as the query writes it).
+fn halmos_vars(cmds: &[Sexp]) -> Vec<(String, String)> {
+    cmds.iter()
+        .filter_map(|c| {
+            let l = c.list()?;
+            let (name, sort) = match l {
+                [Sexp::Atom(d), Sexp::Atom(n), Sexp::List(ps), sort]
+                    if d == "declare-fun" && ps.is_empty() =>
+                {
+                    (n, sort)
+                }
+                [Sexp::Atom(d), Sexp::Atom(n), sort] if d == "declare-const" => (n, sort),
+                _ => return None,
+            };
+            let is_bv = matches!(sort.list(), Some([Sexp::Atom(u), Sexp::Atom(b), _]) if u == "_" && b == "BitVec");
+            (is_bv && is_halmos_name(name)).then(|| (plain(name).to_string(), name.clone()))
+        })
+        .collect()
+}
+
+/// The query with the model's values asserted, ending at its first
+/// `check-sat`. Values for names the query does not declare are left out.
+fn with_values(
+    src: &str,
+    vals: &[(String, u32, BigUint)],
+    declared: &[(String, String)],
+) -> Option<String> {
+    let at = src.find("(check-sat)")?;
+    let mut s = src[..at].to_string();
+    for (n, w, v) in vals {
+        if let Some((_, sym)) = declared.iter().find(|(p, _)| p == n) {
+            let _ = writeln!(s, "(assert (= {sym} (_ bv{v} {w})))");
+        }
+    }
+    s.push_str("(check-sat)\n");
+    Some(s)
+}
+
+/// Halmos's own refinement: the EVM operations it declares as uninterpreted
+/// functions (`f_evm_bvmul_256` and the divisions) get their EVM meaning, as in
+/// Halmos's `refine`. The rewrite gives them that meaning too, so this is the
+/// query its answer is about. Halmos itself asks the abstract query first, and
+/// the refined one only when a model mentions `f_evm_`.
+fn refine(src: &str) -> String {
+    let mut s = src.to_string();
+    for op in ["bvmul", "bvudiv", "bvurem", "bvsdiv", "bvsrem"] {
+        let prefix = format!("(declare-fun f_evm_{op}_");
+        while let Some(i) = s.find(&prefix) {
+            let w: String = s[i + prefix.len()..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            let decl = format!(
+                "(declare-fun f_evm_{op}_{w} ((_ BitVec {w}) (_ BitVec {w})) (_ BitVec {w}))"
+            );
+            if !s[i..].starts_with(&decl) {
+                break;
+            }
+            let body = if op == "bvmul" {
+                format!("({op} x y)")
+            } else {
+                format!("(ite (= y (_ bv0 {w})) (_ bv0 {w}) ({op} x y))")
+            };
+            let def = format!(
+                "(define-fun f_evm_{op}_{w} ((x (_ BitVec {w})) (y (_ BitVec {w}))) (_ BitVec {w}) {body})"
+            );
+            s.replace_range(i..i + decl.len(), &def);
+        }
+    }
+    s
+}
+
+#[derive(Debug, PartialEq)]
+enum ModelCheck {
+    /// The values satisfy the refined query.
+    Valid,
+    Invalid(String),
+    /// Not settled: out of time, no checker, or a query with scopes.
+    Inconclusive,
+    /// The model mentions `f_evm_`: Halmos discards such a model and refines
+    /// the query itself.
+    Discarded,
+}
+
+impl ModelCheck {
+    fn label(&self) -> &'static str {
+        match self {
+            ModelCheck::Valid => "valid",
+            ModelCheck::Invalid(_) => "invalid",
+            ModelCheck::Inconclusive => "inconclusive",
+            ModelCheck::Discarded => "discarded",
+        }
+    }
+}
+
+/// What a disagreement keeps: files, and how each solver run went.
+#[derive(Default)]
+struct Evidence {
+    /// (name, contents)
+    files: Vec<(String, String)>,
+    runs: Vec<serde_json::Value>,
+}
+
+impl Evidence {
+    fn file(&mut self, name: &str, contents: String) {
+        self.files.push((name.to_string(), contents));
+    }
+
+    fn extend(&mut self, other: Evidence) {
+        self.files.extend(other.files);
+        self.runs.extend(other.runs);
+    }
+}
+
+fn secs(d: Duration) -> f64 {
+    (d.as_secs_f64() * 100.0).round() / 100.0
+}
+
+/// A checker's output file, when the check's time ran out first.
+const STOPPED: &str = "(stopped: the check's time ran out)\n";
+
+/// Asks the checker about the query in `f` (saved as `input`) for at most
+/// `budget` (None: no time left), keeping its answer in `ev` as `name`. None
+/// if it did not answer in time, or there is no checker.
+fn ask_checker(
+    f: &Path,
+    input: &str,
+    budget: Option<Duration>,
+    name: &str,
+    ev: &mut Evidence,
+) -> Result<Option<String>> {
+    let Some((budget, cmd)) = budget.and_then(|b| checker(b).map(|c| (b, c))) else {
+        return Ok(None);
+    };
+    let started = Instant::now();
+    let out = run_until(&cmd, f, started + budget)?;
+    ev.runs.push(serde_json::json!({
+        "run": "checker",
+        "command": cmd.join(" "),
+        "input": input,
+        "output": name,
+        "budget_seconds": secs(budget),
+        "seconds": secs(started.elapsed()),
+        "stopped": out.is_none(),
+    }));
+    ev.file(name, out.clone().unwrap_or_else(|| STOPPED.into()));
+    Ok(out)
+}
+
+/// Plugs a model, as Halmos would read it from `text`, into the refined query,
+/// and asks the checker for at most `budget`. Returns what it found, with the
+/// query and the checker's answer as `<tag>.smt2` and `<tag>.out`.
+fn check_model(
+    file: &Path,
+    src: &str,
+    text: &str,
+    budget: Option<Duration>,
+    tag: &str,
+) -> Result<(ModelCheck, Evidence)> {
+    let none = Evidence::default;
+    let Ok(cmds) = parse_sexps(src) else {
+        return Ok((ModelCheck::Inconclusive, none()));
+    };
+    if needs_incremental(&cmds) {
+        return Ok((ModelCheck::Inconclusive, none()));
+    }
+    if text.contains("f_evm_") {
+        return Ok((ModelCheck::Discarded, none()));
+    }
+    let declared = halmos_vars(&cmds);
+    let vals = read_model(text);
+    let invalid = |why: String| Ok((ModelCheck::Invalid(why), none()));
+    if vals.is_empty() && !declared.is_empty() {
+        return invalid("the model gives no value Halmos can read".into());
+    }
+    if let Some((n, w, _)) = vals.iter().find(|(_, w, v)| *v >= pow2(*w)) {
+        return invalid(format!("the value of {n} does not fit in {w} bits"));
+    }
+    if let Some((n, _, _)) = vals
+        .iter()
+        .find(|(n, _, _)| !declared.iter().any(|(p, _)| p == n))
+    {
+        return invalid(format!(
+            "it gives a value to {n}, which the query does not declare"
+        ));
+    }
+    let Some(q) = with_values(&refine(src), &vals, &declared) else {
+        return Ok((ModelCheck::Inconclusive, none()));
+    };
+    let f = file.with_extension(format!("{tag}.smt2"));
+    std::fs::write(&f, &q)?;
+    let mut ev = none();
+    ev.file(&format!("{tag}.smt2"), q);
+    let out = ask_checker(
+        &f,
+        &format!("{tag}.smt2"),
+        budget,
+        &format!("{tag}.out"),
+        &mut ev,
+    )?;
+    let check = match out.as_deref().map(first_line) {
+        Some("sat") => ModelCheck::Valid,
+        Some("unsat") => ModelCheck::Invalid("its values do not satisfy the query".into()),
+        _ => ModelCheck::Inconclusive,
+    };
+    Ok((check, ev))
+}
+
+enum UnsatCheck {
+    Confirmed,
+    /// The checker found a model: its output.
+    Contradicted(String),
+    Inconclusive,
+}
+
+/// Asks the checker the original query: the abstract one first, since if even
+/// it is unsat so is the refined one, and it is the easier of the two; then, if
+/// it has abstract EVM operations, the refined one, which is what the rewrite
+/// answered. The two share one budget: `budget()` is what is left of it, None
+/// once it is spent. Returns what it found, with the checker's answers and the
+/// refined query.
+fn check_unsat(
+    file: &Path,
+    src: &str,
+    budget: &dyn Fn() -> Option<Duration>,
+) -> Result<(UnsatCheck, Evidence)> {
+    let mut ev = Evidence::default();
+    let Some(out) = ask_checker(file, "original.smt2", budget(), "checker.out", &mut ev)? else {
+        return Ok((UnsatCheck::Inconclusive, ev));
+    };
+    if first_line(&out) == "unsat" {
+        return Ok((UnsatCheck::Confirmed, ev));
+    }
+    let refined = refine(src);
+    let out = if refined == src {
+        out
+    } else {
+        let f = file.with_extension("refined.smt2");
+        std::fs::write(&f, &refined)?;
+        ev.file("refined.smt2", refined);
+        let Some(out) = ask_checker(&f, "refined.smt2", budget(), "checker-refined.out", &mut ev)?
+        else {
+            return Ok((UnsatCheck::Inconclusive, ev));
+        };
+        out
+    };
+    let c = match first_line(&out) {
+        "unsat" => UnsatCheck::Confirmed,
+        "sat" => UnsatCheck::Contradicted(out),
+        _ => UnsatCheck::Inconclusive,
+    };
+    Ok((c, ev))
+}
+
+/// What Halmos gets for the rewrite's `unsat` when the check cannot settle it:
+/// `unknown` when every answer must be confirmed, else the `unsat`, as for the
+/// answers the sample did not pick.
+fn unconfirmed_unsat(mode: CheckMode) -> Answer {
+    if mode == CheckMode::All {
+        Answer::Unknown
+    } else {
+        Answer::Unsat
+    }
+}
+
+/// What Halmos gets for a `sat` answer, given its model's check, in every
+/// mode: the answer when the model is valid, or is one Halmos discards and
+/// refines itself; else `unknown`. Every model is checked, so sampling, which
+/// is for `unsat` answers, never lets an unconfirmed one through.
+fn settle_sat(
+    m: &ModelCheck,
+    answer: Answer,
+    passthrough: Option<String>,
+) -> (Answer, Option<String>) {
+    match m {
+        ModelCheck::Valid | ModelCheck::Discarded => (answer, passthrough),
+        ModelCheck::Invalid(_) | ModelCheck::Inconclusive => (Answer::Unknown, None),
+    }
+}
+
+fn answer_label(a: &Answer) -> &'static str {
+    match a {
+        Answer::Unsat => "unsat",
+        Answer::Sat(_) => "sat",
+        Answer::Unknown => "unknown",
+    }
+}
+
+/// What a saved disagreement says about itself, in `about.json`.
+struct About {
+    what: String,
+    /// The answer Halmos got in the end.
+    halmos_got: &'static str,
+    mode: CheckMode,
+    timeout: Duration,
+    /// `--check-timeout`.
+    check_timeout: Duration,
+    /// What the checks of the answer had: `--check-timeout`, or less when the
+    /// query had less time left.
+    check_budget: Duration,
+}
+
+/// Applies the checks to an answer, and says what they found in `rec`.
+///
+/// The checks of the answer share one budget, `cap` (`--check-timeout`), within
+/// the query's own time, which ends at `deadline`: once it is spent no check
+/// starts, and a running one is stopped. Replacing a wrong answer, which means
+/// finding a bit-vector answer and checking its model, may use the rest of the
+/// query's time.
+#[allow(clippy::too_many_arguments)]
+fn checked(
+    file: &Path,
+    src: &str,
+    mode: CheckMode,
+    o: Outcome,
+    timeout: Duration,
+    cap: Duration,
+    deadline: Instant,
+    rec: &mut Record,
+) -> Result<(Answer, Option<String>)> {
+    let start = Instant::now();
+    let check_deadline = deadline.min(start + cap);
+    let check_left = || {
+        let d = check_deadline.saturating_duration_since(Instant::now());
+        (!d.is_zero()).then_some(d)
+    };
+    // As for the rewrite, a solver gets at least a second.
+    let left = || {
+        deadline
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_secs(1))
+    };
+    let about = |what: &str, got: &Answer| About {
+        what: what.to_string(),
+        halmos_got: answer_label(got),
+        mode,
+        timeout,
+        check_timeout: cap,
+        check_budget: check_deadline.saturating_duration_since(start),
+    };
+    match (&o.answer, o.by) {
+        (Answer::Unsat, By::Rewrite) => {
+            if !mode.picks(src) {
+                rec.check = "unchecked".into();
+                return Ok((Answer::Unsat, None));
+            }
+            let (c, mut ev) = check_unsat(file, src, &check_left)?;
+            match c {
+                UnsatCheck::Confirmed => {
+                    rec.check = "confirmed".into();
+                    Ok((Answer::Unsat, None))
+                }
+                UnsatCheck::Contradicted(model) => {
+                    // The checker's answer replaces the rewrite's, once its
+                    // model is checked too.
+                    rec.check = "contradicted".into();
+                    let (m, model_ev) =
+                        check_model(file, src, &model, Some(left()), "model-check")?;
+                    ev.extend(model_ev);
+                    rec.model = Some(m.label().into());
+                    let (a, p) = settle_sat(&m, Answer::Sat(Vec::new()), Some(model));
+                    let what = "the rewrite answered unsat; the checker found a model";
+                    rec.saved = save(src, &o, &ev, &about(what, &a));
+                    Ok((a, p))
+                }
+                UnsatCheck::Inconclusive => {
+                    rec.check = "inconclusive".into();
+                    Ok((unconfirmed_unsat(mode), None))
+                }
+            }
+        }
+        (Answer::Sat(_), by) => {
+            let text = render(&o.answer, o.passthrough.as_deref());
+            let (m, model_ev) = check_model(file, src, &text, check_left(), "model-check")?;
+            rec.model = Some(m.label().into());
+            let ModelCheck::Invalid(why) = &m else {
+                return Ok(settle_sat(&m, o.answer, o.passthrough));
+            };
+            let what = format!("a sat model was wrong: {why}");
+            let mut ev = Evidence::default();
+            ev.file("candidate.out", text);
+            ev.extend(model_ev);
+            let (a, p) = if by == By::BitVector {
+                (Answer::Unknown, None)
+            } else {
+                // The rewrite's model is wrong: a bit-vector solver answers
+                // instead, and its model is checked too.
+                let incremental = parse_sexps(src).is_ok_and(|c| needs_incremental(&c));
+                let (budget, started) = (left(), Instant::now());
+                let (a, p, cmd) = bit_vector(file, budget, incremental)?;
+                ev.runs.push(serde_json::json!({
+                    "run": "replacement",
+                    "command": cmd.map(|c| c.join(" ")),
+                    "input": "original.smt2",
+                    "output": "replacement.out",
+                    "budget_seconds": secs(budget),
+                    "seconds": secs(started.elapsed()),
+                }));
+                ev.file("replacement.out", p.clone().unwrap_or_default());
+                if matches!(a, Answer::Sat(_)) {
+                    let again = render(&a, p.as_deref());
+                    let (m2, again_ev) =
+                        check_model(file, src, &again, Some(left()), "replacement-check")?;
+                    ev.extend(again_ev);
+                    rec.replacement = Some(m2.label().into());
+                    settle_sat(&m2, a, p)
+                } else {
+                    rec.replacement = Some(answer_label(&a).into());
+                    (a, p)
+                }
+            };
+            rec.saved = save(src, &o, &ev, &about(&what, &a));
+            Ok((a, p))
+        }
+        _ => Ok((o.answer, o.passthrough)),
+    }
+}
+
+/// Where disagreements are saved: `AUSWEG_SMT_SAVE_DIR`, else the temp
+/// directory.
+fn save_dir() -> PathBuf {
+    #[cfg(test)]
+    if let Some(d) = TEST_SAVE_DIR.with(|d| d.borrow().clone()) {
+        return d;
+    }
+    std::env::var_os("AUSWEG_SMT_SAVE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("ausweg-rewrite-checks"))
+}
+
+/// Keeps everything needed to reproduce a disagreement: the original and
+/// translated queries, the answer and every check of it, with the queries the
+/// checks asked, any replacement and its check, and the versions, settings and
+/// budgets. Returns the directory.
+fn save(src: &str, o: &Outcome, evidence: &Evidence, about: &About) -> Option<String> {
+    let dir = save_dir().join(format!("{:016x}", fnv1a(0, src)));
+    // Only this disagreement's files: none left from an earlier run.
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).ok()?;
+    let mut files = vec![("original.smt2".to_string(), src.to_string())];
+    // The answer being checked, and the run that gave it.
+    let (input, output) = match o.by {
+        By::Rewrite => ("translated.smt2", "rewrite.out"),
+        By::BitVector => ("original.smt2", "bit-vector.out"),
+    };
+    if o.by == By::Rewrite
+        && let Some(t) = o
+            .run
+            .as_ref()
+            .and_then(|r| std::fs::read_to_string(&r.input).ok())
+    {
+        files.push((input.into(), t));
+    }
+    if let Some(out) = o.rewrite_out.as_ref().or(o.passthrough.as_ref()) {
+        files.push((output.into(), out.clone()));
+    }
+    let mut runs = vec![serde_json::json!({
+        "run": match o.by {
+            By::Rewrite => "rewrite",
+            By::BitVector => "bit-vector",
+        },
+        "command": o.run.as_ref().map(|r| r.command.join(" ")),
+        "input": input,
+        "output": output,
+        "budget_seconds": o.run.as_ref().map(|r| secs(r.budget)),
+        "seconds": o.run.as_ref().map(|r| secs(r.took)),
+    })];
+    runs.extend(evidence.runs.iter().cloned());
+    files.extend(evidence.files.iter().cloned());
+    for (name, contents) in &files {
+        std::fs::write(dir.join(name), contents).ok()?;
+    }
+    let version = |cmd: Option<Vec<String>>| -> String {
+        cmd.and_then(|c| Command::new(&c[0]).arg("--version").output().ok())
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string()
+            })
+            .unwrap_or_default()
+    };
+    let timeout = about.timeout;
+    let json = serde_json::json!({
+        "what": about.what,
+        "halmos_got": about.halmos_got,
+        "ausweg": env!("CARGO_PKG_VERSION"),
+        "check": about.mode.to_env(),
+        "timeout_seconds": timeout.as_secs(),
+        "check_timeout_seconds": about.check_timeout.as_secs(),
+        "check_budget_seconds": secs(about.check_budget),
+        "integer_solver": int_solver(timeout).map(|c| c.join(" ")),
+        "integer_solver_version": version(int_solver(timeout)),
+        "checker": checker(about.check_timeout).map(|c| c.join(" ")),
+        "checker_version": version(checker(about.check_timeout)),
+        "fallback": bv_solver(timeout, false).map(|c| c.join(" ")),
+        "fallback_version": version(bv_solver(timeout, false)),
+        "files": files.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+        "runs": runs,
+    });
+    std::fs::write(
+        dir.join("about.json"),
+        serde_json::to_string_pretty(&json).ok()?,
+    )
+    .ok()?;
+    Some(dir.display().to_string())
+}
+
+/// What `ausweg smt` did with one query, as one line of `AUSWEG_SMT_LOG`.
+#[derive(Debug, Default, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Record {
+    /// FNV-1a hash of the query text.
+    pub query: String,
+    /// What Halmos got: `sat`, `unsat` or `unknown`.
+    pub answer: String,
+    /// `rewrite` or `bit-vector`: who answered before the checks.
+    pub by: String,
+    /// For the rewrite's `unsat`: `unchecked`, `confirmed`, `contradicted` or
+    /// `inconclusive`; else `none`.
+    pub check: String,
+    /// For a `sat` model: `valid`, `invalid`, `inconclusive`, or `discarded`
+    /// (it mentions `f_evm_`, so Halmos discards it and refines the query).
+    /// For a contradicted `unsat`, this is the checker's model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Where a disagreement was saved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saved: Option<String>,
+    /// For a wrong rewrite model, what replaced it: its model's check, as for
+    /// `model`, or `unsat` or `unknown`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement: Option<String>,
+}
+
+fn record(rec: &Record) {
+    let Some(path) = std::env::var_os("AUSWEG_SMT_LOG") else {
+        return;
+    };
+    let Ok(line) = serde_json::to_string(rec) else {
+        return;
+    };
+    // One short write with O_APPEND: lines from parallel queries do not interleave.
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        use std::io::Write as _;
+        let _ = f.write_all(format!("{line}\n").as_bytes());
+    }
+}
+
+/// What the checks found over a run: the counts behind `rewrite check:`.
+#[derive(Debug, Default, Clone, PartialEq, serde::Serialize)]
+pub struct RewriteCheck {
+    /// `AUSWEG_CHECK`: `off`, `all`, or `sample:<every>:<seed>`.
+    pub mode: String,
+    /// Queries answered.
+    pub queries: u64,
+    /// `unsat` answers from the rewrite.
+    pub rewrite_unsat: u64,
+    /// Of those, checked against the original query.
+    pub checked: u64,
+    pub confirmed: u64,
+    pub inconclusive: u64,
+    pub contradicted: u64,
+    /// `sat` models plugged into the original query, whoever produced them:
+    /// the rewrite, a bit-vector solver, a replacement, or the checker.
+    pub models_checked: u64,
+    pub models_invalid: u64,
+    pub models_inconclusive: u64,
+    /// Models that mention `f_evm_`: Halmos discards them and refines the
+    /// query itself, so they are passed on unchecked.
+    pub models_discarded: u64,
+    /// Answers Halmos got as `unknown` because of a check: it could not confirm
+    /// them, or found them wrong with no confirmed answer to replace them.
+    pub made_unknown: u64,
+    /// Answers a bit-vector solver gave on its own, with no rewrite involved.
+    pub bit_vector: u64,
+    /// Where disagreements were saved.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub saved: Vec<String>,
+}
+
+impl RewriteCheck {
+    pub fn from_log(mode: CheckMode, log: &str) -> RewriteCheck {
+        let mut r = RewriteCheck {
+            mode: mode.to_env(),
+            ..Default::default()
+        };
+        for rec in log
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Record>(l).ok())
+        {
+            r.queries += 1;
+            if rec.by == "bit-vector" {
+                r.bit_vector += 1;
+            }
+            match rec.check.as_str() {
+                "unchecked" => r.rewrite_unsat += 1,
+                "confirmed" => {
+                    r.rewrite_unsat += 1;
+                    r.checked += 1;
+                    r.confirmed += 1;
+                }
+                "inconclusive" => {
+                    r.rewrite_unsat += 1;
+                    r.checked += 1;
+                    r.inconclusive += 1;
+                }
+                "contradicted" => {
+                    r.rewrite_unsat += 1;
+                    r.checked += 1;
+                    r.contradicted += 1;
+                }
+                _ => {}
+            }
+            for model in [rec.model.as_deref(), rec.replacement.as_deref()] {
+                match model {
+                    Some("valid") => r.models_checked += 1,
+                    Some("invalid") => {
+                        r.models_checked += 1;
+                        r.models_invalid += 1;
+                    }
+                    Some("inconclusive") => {
+                        r.models_checked += 1;
+                        r.models_inconclusive += 1;
+                    }
+                    Some("discarded") => r.models_discarded += 1,
+                    _ => {}
+                }
+            }
+            let checks_decided = matches!(rec.check.as_str(), "inconclusive" | "contradicted")
+                || matches!(rec.model.as_deref(), Some("invalid" | "inconclusive"));
+            if rec.answer == "unknown" && checks_decided {
+                r.made_unknown += 1;
+            }
+            if let Some(s) = rec.saved
+                && !r.saved.contains(&s)
+            {
+                r.saved.push(s);
+            }
+        }
+        r
+    }
+
+    /// Answers that disagreed with the original query.
+    pub fn disagreements(&self) -> u64 {
+        self.contradicted + self.models_invalid
     }
 }
 
@@ -2152,5 +3236,752 @@ mod tests {
         );
         assert!(s.starts_with("sat\n"));
         assert!(s.contains("(define-fun p_i_uint256_a_00 () (_ BitVec 256) #x0000000000000000000000000000000000000000000000000000000000000002)"));
+    }
+
+    // ------------------------------------------------------------ Step 17
+
+    #[test]
+    fn check_modes_round_trip_and_sample_reproducibly() {
+        for m in [
+            CheckMode::Off,
+            CheckMode::All,
+            CheckMode::Sample { every: 16, seed: 7 },
+        ] {
+            assert_eq!(CheckMode::from_env_value(&m.to_env()), Some(m));
+        }
+        assert_eq!(CheckMode::from_env_value("sample:0:1"), None);
+        assert_eq!(CheckMode::from_env_value("sample:16"), None);
+        let queries: Vec<String> = (0..1600)
+            .map(|i| format!("(assert (= p_x #x{i:04x}))"))
+            .collect();
+        let picked = |m: CheckMode| -> Vec<usize> {
+            (0..queries.len())
+                .filter(|&i| m.picks(&queries[i]))
+                .collect()
+        };
+        let a = picked(CheckMode::Sample { every: 16, seed: 0 });
+        // The same seed picks the same queries; about 1 in 16 of them.
+        assert_eq!(a, picked(CheckMode::Sample { every: 16, seed: 0 }));
+        assert!((60..140).contains(&a.len()), "{} picked", a.len());
+        assert_ne!(a, picked(CheckMode::Sample { every: 16, seed: 1 }));
+        assert_eq!(picked(CheckMode::Sample { every: 1, seed: 0 }).len(), 1600);
+        assert_eq!(picked(CheckMode::All).len(), 1600);
+        assert!(picked(CheckMode::Off).is_empty());
+    }
+
+    #[test]
+    fn a_query_hashes_the_same_on_every_run() {
+        let a = "(declare-fun p_x_uint256_ec447be_00 () (_ BitVec 256))\n(assert (= p_x_uint256_ec447be_00 balance_fadc0a7_01))";
+        let b = "(declare-fun p_x_uint256_3b7ca34_00 () (_ BitVec 256))\n(assert (= p_x_uint256_3b7ca34_00 balance_0e1d2c3_01))";
+        assert_eq!(fnv1a(0, a), fnv1a(0, b));
+        assert_ne!(fnv1a(0, a), fnv1a(0, &a.replace("_00", "_01")));
+        assert_ne!(fnv1a(0, a), fnv1a(1, a));
+        // Only a seven-digit id between underscores, before the counter, goes.
+        assert_eq!(without_run_ids("p_x_uint256_ec447be_00"), "p_x_uint256_00");
+        assert_eq!(without_run_ids("f_evm_bvmul_256"), "f_evm_bvmul_256");
+        assert_eq!(
+            without_run_ids("storage_aaaa0001_1_0_0_cafe123_02"),
+            "storage_aaaa0001_1_0_0_02"
+        );
+    }
+
+    #[test]
+    fn an_unconfirmed_unsat_is_unknown_only_when_checking_every_answer() {
+        assert_eq!(unconfirmed_unsat(CheckMode::All), Answer::Unknown);
+        assert_eq!(unconfirmed_unsat(CheckMode::DEFAULT), Answer::Unsat);
+    }
+
+    #[test]
+    fn reads_models_the_way_halmos_does() {
+        let out = "sat\n(\n  (define-fun p_x () (_ BitVec 8) #xff)\n  (define-fun halmos_y () (_ BitVec 3) #b101)\n  (define-fun p_z () (_ BitVec 256) (_ bv12 256))\n  (define-fun other () (_ BitVec 8) #x01)\n  (define-fun p_f ((a (_ BitVec 8))) (_ BitVec 8) a)\n)\n";
+        let got = read_model(out);
+        let names: Vec<(&str, u32, u32)> = got
+            .iter()
+            .map(|(n, w, v)| (n.as_str(), *w, v.to_u32().unwrap()))
+            .collect();
+        assert_eq!(
+            names,
+            vec![("p_x", 8, 255), ("halmos_y", 3, 5), ("p_z", 256, 12)]
+        );
+        // yices's own model format, which Halmos does not read.
+        assert!(read_model("sat\n(= p_x #b11111111)\n").is_empty());
+        // What render writes, read back.
+        let vals = vec![("p_a".to_string(), 8, BigUint::from(7u32))];
+        assert_eq!(read_model(&render(&Answer::Sat(vals.clone()), None)), vals);
+    }
+
+    #[test]
+    fn corrupts_every_value_halmos_reads() {
+        // The changed value stays in range: 255 + 1 wraps to 0.
+        let max = "sat\n((define-fun p_x () (_ BitVec 8) (_ bv255 8)))\n";
+        assert_eq!(read_model(&corrupt_values(max))[0].2, BigUint::from(0u32));
+        let dec = "sat\n((define-fun p_x () (_ BitVec 8) (_ bv12 8))\n (define-fun p_y () (_ BitVec 8) (_ bv1 8)))\n";
+        let changed = read_model(&corrupt_values(dec));
+        assert_eq!(changed[0].2, BigUint::from(13u32));
+        assert_eq!(changed[1].2, BigUint::from(2u32));
+        for lit in ["#x0f", "#x00", "#b1", "#b0"] {
+            let out = format!("sat\n((define-fun p_x () (_ BitVec 8) {lit}))\n");
+            assert_ne!(read_model(&out), read_model(&corrupt_values(&out)), "{lit}");
+        }
+    }
+
+    #[test]
+    fn the_log_counts_what_the_checks_found() {
+        let lines = [
+            r#"{"query":"a","answer":"unsat","by":"rewrite","check":"unchecked"}"#,
+            r#"{"query":"b","answer":"unsat","by":"rewrite","check":"confirmed"}"#,
+            r#"{"query":"c","answer":"unsat","by":"rewrite","check":"inconclusive"}"#,
+            r#"{"query":"d","answer":"sat","by":"rewrite","check":"contradicted","model":"valid","saved":"/x/d"}"#,
+            r#"{"query":"e","answer":"sat","by":"rewrite","check":"none","model":"valid"}"#,
+            r#"{"query":"f","answer":"unknown","by":"bit-vector","check":"none","model":"invalid","saved":"/x/f"}"#,
+            r#"{"query":"g","answer":"unknown","by":"rewrite","check":"none"}"#,
+            r#"{"query":"h","answer":"sat","by":"bit-vector","check":"none","model":"discarded"}"#,
+            r#"{"query":"i","answer":"unknown","by":"rewrite","check":"inconclusive"}"#,
+            r#"{"query":"j","answer":"unknown","by":"rewrite","check":"none","model":"inconclusive"}"#,
+            r#"{"query":"k","answer":"sat","by":"rewrite","check":"none","model":"invalid","saved":"/x/k","replacement":"discarded"}"#,
+            r#"{"query":"l","answer":"unknown","by":"rewrite","check":"none","model":"invalid","saved":"/x/l","replacement":"unknown"}"#,
+            "not json",
+        ];
+        let c = RewriteCheck::from_log(CheckMode::DEFAULT, &lines.join("\n"));
+        assert_eq!(c.mode, "sample:16:0");
+        assert_eq!((c.queries, c.rewrite_unsat, c.checked), (12, 5, 4));
+        assert_eq!((c.confirmed, c.inconclusive, c.contradicted), (1, 2, 1));
+        // Every model checked: d's is the checker's, k's replacement is discarded.
+        assert_eq!(
+            (c.models_checked, c.models_invalid, c.models_inconclusive),
+            (6, 3, 1)
+        );
+        assert_eq!(
+            (c.models_discarded, c.bit_vector, c.disagreements()),
+            (2, 2, 4)
+        );
+        // f, i, j and l; g's unknown was the solver's own.
+        assert_eq!(c.made_unknown, 4);
+        assert_eq!(c.saved, vec!["/x/d", "/x/f", "/x/k", "/x/l"]);
+    }
+
+    /// A query file in its own directory, for the tests that call solvers.
+    fn query_file(name: &str, src: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ausweg-test-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("query.smt2");
+        std::fs::write(&f, src).unwrap();
+        f
+    }
+
+    fn have_yices() -> bool {
+        let found = find_on_path("yices-smt2").is_some();
+        if !found {
+            eprintln!("skipped: yices-smt2 is not installed");
+        }
+        found
+    }
+
+    // x + 1 == 0 holds for x = 255 only.
+    const WRAPS: &str = "(set-logic QF_AUFBV)\n(declare-fun p_x () (_ BitVec 8))\n(assert (= (bvadd p_x #x01) #x00))\n(check-sat)\n(get-model)\n";
+
+    #[test]
+    fn a_wrong_or_unreadable_model_is_caught() {
+        if !have_yices() {
+            return;
+        }
+        let f = query_file("model", WRAPS);
+        let budget = Duration::from_secs(10);
+        let model = |x: u32| {
+            render(
+                &Answer::Sat(vec![("p_x".into(), 8, BigUint::from(x))]),
+                None,
+            )
+        };
+        assert_eq!(
+            check_model(&f, WRAPS, &model(255), Some(budget), "t")
+                .unwrap()
+                .0,
+            ModelCheck::Valid
+        );
+        assert!(matches!(
+            check_model(&f, WRAPS, &model(0), Some(budget), "t")
+                .unwrap()
+                .0,
+            ModelCheck::Invalid(_)
+        ));
+        // A literal too wide for its variable.
+        let wide = "sat\n((define-fun p_x () (_ BitVec 8) (_ bv256 8)))\n";
+        assert!(matches!(
+            check_model(&f, WRAPS, wide, Some(budget), "t").unwrap().0,
+            ModelCheck::Invalid(_)
+        ));
+        // The 0.7.0 bug: a model Halmos could not read at all.
+        assert!(matches!(
+            check_model(&f, WRAPS, "sat\n(= p_x #b11111111)\n", Some(budget), "t")
+                .unwrap()
+                .0,
+            ModelCheck::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn a_wrong_model_from_the_rewrite_is_replaced_by_the_bit_vector_answer() {
+        if !have_yices() {
+            return;
+        }
+        saving_to("replace");
+        let f = query_file("replace", WRAPS);
+        let o = Outcome {
+            answer: Answer::Sat(vec![("p_x".into(), 8, BigUint::from(0u32))]),
+            passthrough: None,
+            by: By::Rewrite,
+            rewrite_out: Some("sat\n((p_x 0))\n".into()),
+            run: Some(SolverRun {
+                command: vec!["z3".into(), "-T:10".into()],
+                input: f.clone(),
+                budget: Duration::from_secs(10),
+                took: Duration::from_millis(30),
+            }),
+        };
+        let mut rec = Record::default();
+        let deadline = || Instant::now() + Duration::from_secs(10);
+        let (a, p) = checked(
+            &f,
+            WRAPS,
+            CheckMode::DEFAULT,
+            o,
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+            deadline(),
+            &mut rec,
+        )
+        .unwrap();
+        assert_eq!(a, Answer::Sat(Vec::new()));
+        assert_eq!(
+            read_model(p.as_deref().unwrap())[0].2,
+            BigUint::from(255u32)
+        );
+        assert_eq!(rec.model.as_deref(), Some("invalid"));
+        assert_eq!(rec.replacement.as_deref(), Some("valid"));
+        // Everything to reproduce it: the rejected model, the validator's
+        // answer to it, the replacement and its check, and the budgets.
+        let saved = PathBuf::from(rec.saved.unwrap());
+        let read = |name: &str| std::fs::read_to_string(saved.join(name)).unwrap_or_default();
+        assert!(read("candidate.out").contains("(define-fun p_x () (_ BitVec 8) #x00)"));
+        assert!(read("model-check.smt2").contains("(assert (= p_x (_ bv0 8)))"));
+        assert_eq!(first_line(&read("model-check.out")), "unsat");
+        assert_eq!(first_line(&read("replacement.out")), "sat");
+        assert_eq!(first_line(&read("replacement-check.out")), "sat");
+        let about: serde_json::Value = serde_json::from_str(&read("about.json")).unwrap();
+        assert_eq!(about["halmos_got"], "sat");
+        assert_eq!(about["check_timeout_seconds"], 10);
+        assert!(about["check_budget_seconds"].as_f64().unwrap() > 9.0);
+        // Every run: the rewrite's, the check of its model, the replacement and
+        // the replacement's check, each with the command it ran.
+        let runs: Vec<&str> = about["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["output"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            runs,
+            [
+                "rewrite.out",
+                "model-check.out",
+                "replacement.out",
+                "replacement-check.out"
+            ]
+        );
+        // Every run with its budget and time; a check also says whether it was
+        // stopped.
+        for r in about["runs"].as_array().unwrap() {
+            assert!(
+                r["budget_seconds"].as_f64().is_some() && r["seconds"].as_f64().is_some(),
+                "{r}"
+            );
+        }
+        assert_eq!(about["runs"][0]["budget_seconds"], 10.0);
+        let check = &about["runs"][1];
+        assert!(
+            check["command"].as_str().unwrap().contains("--timeout=10"),
+            "{check}"
+        );
+        assert_eq!(check["stopped"], false);
+        assert!(
+            about["fallback_version"]
+                .as_str()
+                .unwrap()
+                .contains("Yices")
+        );
+    }
+
+    // The example from Step 17: x + y < x needs the sum to wrap.
+    const OVERFLOWS: &str = "(set-logic QF_AUFBV)\n(declare-fun p_x () (_ BitVec 256))\n(declare-fun p_y () (_ BitVec 256))\n(assert (bvult (bvadd p_x p_y) p_x))\n(check-sat)\n(get-model)\n";
+
+    #[test]
+    fn a_false_unsat_is_contradicted_and_halmos_gets_the_real_model() {
+        if !have_yices() {
+            return;
+        }
+        saving_to("unsat");
+        let f = query_file("unsat", OVERFLOWS);
+        // A rewrite that forgot the wraparound would answer unsat.
+        let wrong = || Outcome {
+            answer: Answer::Unsat,
+            passthrough: None,
+            by: By::Rewrite,
+            rewrite_out: Some("unsat\n".into()),
+            run: None,
+        };
+        let deadline = || Instant::now() + Duration::from_secs(20);
+        for mode in [CheckMode::All, CheckMode::Sample { every: 1, seed: 0 }] {
+            let mut rec = Record::default();
+            let (a, p) = checked(
+                &f,
+                OVERFLOWS,
+                mode,
+                wrong(),
+                Duration::from_secs(10),
+                Duration::from_secs(10),
+                deadline(),
+                &mut rec,
+            )
+            .unwrap();
+            assert_eq!(a, Answer::Sat(Vec::new()));
+            assert_eq!(rec.check, "contradicted");
+            assert_eq!(rec.model.as_deref(), Some("valid"));
+            let saved = PathBuf::from(rec.saved.unwrap());
+            for file in ["original.smt2", "rewrite.out", "checker.out", "about.json"] {
+                assert!(saved.join(file).is_file(), "{file}");
+            }
+            // Halmos reads x and y from the output, and they do overflow.
+            let m = read_model(p.as_deref().unwrap());
+            let (x, y) = (&m[0].2, &m[1].2);
+            assert!((x + y) % pow2(256) < *x);
+        }
+        // Not picked by the sample: the rewrite's answer stands.
+        let mut rec = Record::default();
+        let never = CheckMode::Sample {
+            every: u64::MAX,
+            seed: 3,
+        };
+        if !never.picks(OVERFLOWS) {
+            let (a, _) = checked(
+                &f,
+                OVERFLOWS,
+                never,
+                wrong(),
+                Duration::from_secs(10),
+                Duration::from_secs(10),
+                deadline(),
+                &mut rec,
+            )
+            .unwrap();
+            assert_eq!((a, rec.check.as_str()), (Answer::Unsat, "unchecked"));
+        }
+    }
+
+    // x / 2 > x is impossible for division, but an uninterpreted f_evm_bvudiv
+    // can return anything: the abstract query is sat, the refined one unsat.
+    const HALVES: &str = "(set-logic QF_AUFBV)\n(declare-fun f_evm_bvudiv_256 ((_ BitVec 256) (_ BitVec 256)) (_ BitVec 256))\n(declare-fun p_x () (_ BitVec 256))\n(assert (bvugt (f_evm_bvudiv_256 p_x (_ bv2 256)) p_x))\n(check-sat)\n(get-model)\n";
+
+    #[test]
+    fn refines_like_halmos() {
+        let r = refine(HALVES);
+        assert!(r.contains("(define-fun f_evm_bvudiv_256 ((x (_ BitVec 256)) (y (_ BitVec 256))) (_ BitVec 256) (ite (= y (_ bv0 256)) (_ bv0 256) (bvudiv x y)))"));
+        assert!(!r.contains("declare-fun f_evm_"));
+        let mul = "(declare-fun f_evm_bvmul_512 ((_ BitVec 512) (_ BitVec 512)) (_ BitVec 512))";
+        assert_eq!(
+            refine(mul),
+            "(define-fun f_evm_bvmul_512 ((x (_ BitVec 512)) (y (_ BitVec 512))) (_ BitVec 512) (bvmul x y))"
+        );
+        assert_eq!(refine(WRAPS), WRAPS);
+    }
+
+    #[test]
+    fn an_unsat_about_evm_division_is_checked_against_its_meaning() {
+        if !have_yices() {
+            return;
+        }
+        let f = query_file("refine", HALVES);
+        let left = || Some(Duration::from_secs(20));
+        let (c, _) = check_unsat(&f, HALVES, &left).unwrap();
+        assert!(matches!(c, UnsatCheck::Confirmed));
+    }
+
+    /// This test thread's checker: `sh -c <script> -- <query file>`.
+    fn fake_checker(script: &str) {
+        TEST_CHECKER.with(|c| {
+            *c.borrow_mut() = Some(vec!["sh".into(), "-c".into(), script.into(), "--".into()])
+        });
+    }
+
+    /// Where this test thread saves disagreements: a new directory.
+    fn saving_to(name: &str) -> PathBuf {
+        let d =
+            std::env::temp_dir().join(format!("ausweg-test-saved-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        TEST_SAVE_DIR.with(|s| *s.borrow_mut() = Some(d.clone()));
+        d
+    }
+
+    /// The rewrite's answer x = 0 to WRAPS, which needs x = 255.
+    fn wrong_rewrite_model() -> Outcome {
+        Outcome {
+            answer: Answer::Sat(vec![("p_x".into(), 8, BigUint::from(0u32))]),
+            passthrough: None,
+            by: By::Rewrite,
+            rewrite_out: Some("sat\n((p_x 0))\n".into()),
+            run: None,
+        }
+    }
+
+    #[test]
+    fn an_unconfirmed_model_is_unknown_in_every_mode() {
+        // A checker that settles nothing: x = 0 is neither confirmed nor refuted.
+        fake_checker("echo unknown");
+        let f = query_file("unconfirmed", WRAPS);
+        let ten = Duration::from_secs(10);
+        let run = |mode| {
+            let mut rec = Record::default();
+            let (a, _) = checked(
+                &f,
+                WRAPS,
+                mode,
+                wrong_rewrite_model(),
+                ten,
+                ten,
+                Instant::now() + ten,
+                &mut rec,
+            )
+            .unwrap();
+            (a, rec.model)
+        };
+        // GPT's case: Halmos would read x = 0 as a counterexample. Sampling is
+        // for unsat answers only: a model is confirmed in every mode.
+        for mode in [CheckMode::All, CheckMode::DEFAULT] {
+            assert_eq!(run(mode), (Answer::Unknown, Some("inconclusive".into())));
+        }
+    }
+
+    #[test]
+    fn an_unconfirmed_replacement_is_unknown_in_every_mode() {
+        if !have_yices() {
+            return;
+        }
+        // The checker refutes the rewrite's x = 0, then cannot settle the
+        // bit-vector solver's x = 255.
+        fake_checker(r#"case "$1" in *replacement-check*) echo unknown;; *) echo unsat;; esac"#);
+        saving_to("unconfirmed-swap");
+        let f = query_file("unconfirmed-swap", WRAPS);
+        let ten = Duration::from_secs(10);
+        let run = |mode| {
+            let mut rec = Record::default();
+            let (a, p) = checked(
+                &f,
+                WRAPS,
+                mode,
+                wrong_rewrite_model(),
+                ten,
+                ten,
+                Instant::now() + ten,
+                &mut rec,
+            )
+            .unwrap();
+            (a, p, rec)
+        };
+        for mode in [CheckMode::All, CheckMode::DEFAULT] {
+            let (a, p, rec) = run(mode);
+            assert_eq!(
+                (a, p, rec.model.as_deref()),
+                (Answer::Unknown, None, Some("invalid"))
+            );
+            assert_eq!(rec.replacement.as_deref(), Some("inconclusive"));
+            let saved = PathBuf::from(rec.saved.unwrap());
+            let read = |name: &str| std::fs::read_to_string(saved.join(name)).unwrap();
+            let about: serde_json::Value = serde_json::from_str(&read("about.json")).unwrap();
+            assert_eq!(about["halmos_got"], "unknown");
+            assert_eq!(first_line(&read("replacement-check.out")), "unknown");
+        }
+    }
+
+    #[test]
+    fn a_model_from_the_checker_is_checked_like_any_other() {
+        // The checker contradicts the rewrite's unsat with a model it cannot
+        // then confirm: Halmos gets unknown, sampling or not.
+        fake_checker(
+            r#"case "$1" in *model-check*) echo unknown;; *) printf 'sat\n((define-fun p_x () (_ BitVec 8) #xff))\n';; esac"#,
+        );
+        saving_to("contradicted-unconfirmed");
+        let f = query_file("contradicted-unconfirmed", WRAPS);
+        let ten = Duration::from_secs(10);
+        for mode in [CheckMode::All, CheckMode::Sample { every: 1, seed: 0 }] {
+            let o = Outcome {
+                answer: Answer::Unsat,
+                passthrough: None,
+                by: By::Rewrite,
+                rewrite_out: Some("unsat\n".into()),
+                run: None,
+            };
+            let mut rec = Record::default();
+            let (a, _) =
+                checked(&f, WRAPS, mode, o, ten, ten, Instant::now() + ten, &mut rec).unwrap();
+            assert_eq!(
+                (a, rec.check.as_str(), rec.model.as_deref()),
+                (Answer::Unknown, "contradicted", Some("inconclusive"))
+            );
+        }
+    }
+
+    // Names in |...|, as Halmos may quote them: one that does not need the
+    // quotes, one that does.
+    const QUOTED: &str = "(set-logic QF_AUFBV)\n(declare-fun |p_y_uint8_abc1234_00| () (_ BitVec 8))\n(declare-fun |p_z[0]_uint8_abc1234_01| () (_ BitVec 8))\n(assert (= (bvadd |p_y_uint8_abc1234_00| #x01) #x00))\n(assert (= |p_z[0]_uint8_abc1234_01| #x07))\n(check-sat)\n(get-model)\n";
+
+    #[test]
+    fn quoted_names_are_read_and_checked() {
+        let mut g = Graph::default();
+        for c in &parse_sexps(QUOTED).unwrap() {
+            g.command(c).unwrap();
+        }
+        assert_eq!(translate(&g).model_vars.len(), 2);
+        if !have_yices() {
+            return;
+        }
+        let f = query_file("quoted", QUOTED);
+        let model = |y: &str, z: &str| {
+            format!(
+                "sat\n((define-fun |p_y_uint8_abc1234_00| () (_ BitVec 8) {y})\n (define-fun |p_z[0]_uint8_abc1234_01| () (_ BitVec 8) {z}))\n"
+            )
+        };
+        let check = |text: &str| {
+            check_model(&f, QUOTED, text, Some(Duration::from_secs(10)), "t")
+                .unwrap()
+                .0
+        };
+        assert_eq!(check(&model("#xff", "#x07")), ModelCheck::Valid);
+        assert!(matches!(
+            check(&model("#x00", "#x07")),
+            ModelCheck::Invalid(_)
+        ));
+        assert!(matches!(
+            check(&model("#xff", "#x00")),
+            ModelCheck::Invalid(_)
+        ));
+        // GPT's case: one name quoted and one not, the quoted one wrong.
+        let mixed = "sat\n((define-fun |p_y_uint8_abc1234_00| () (_ BitVec 8) #x00)\n (define-fun p_z[0]_uint8_abc1234_01 () (_ BitVec 8) #x07))\n";
+        assert!(matches!(check(mixed), ModelCheck::Invalid(_)));
+        // A value for a name the query does not declare.
+        let extra = "sat\n((define-fun |p_y_uint8_abc1234_00| () (_ BitVec 8) #xff)\n (define-fun |p_z[0]_uint8_abc1234_01| () (_ BitVec 8) #x07)\n (define-fun p_w_uint8_abc1234_02 () (_ BitVec 8) #x00))\n";
+        assert!(matches!(check(extra), ModelCheck::Invalid(_)));
+        // The rewrite reads quoted names back from the integer solver, which
+        // writes the quotes only where they are needed.
+        if find_on_path("z3").is_some() {
+            let o = solve_unchecked(&f, Duration::from_secs(20)).unwrap();
+            assert_eq!(o.by, By::Rewrite);
+            let Answer::Sat(v) = &o.answer else {
+                panic!("not sat: {:?}", o.answer)
+            };
+            let mut vals: Vec<_> = v
+                .iter()
+                .map(|(n, _, x)| (n.as_str(), x.to_u32().unwrap()))
+                .collect();
+            vals.sort();
+            assert_eq!(
+                vals,
+                [
+                    ("|p_y_uint8_abc1234_00|", 255),
+                    ("|p_z[0]_uint8_abc1234_01|", 7)
+                ]
+            );
+            assert_eq!(check(&render(&o.answer, None)), ModelCheck::Valid);
+        }
+    }
+
+    /// What Halmos's own parser (`halmos.solve.parse_model_str`) reads from a
+    /// solver's output: (name, width, value). None without Halmos's Python.
+    fn halmos_reads(out: &str) -> Option<Vec<(String, u32, BigUint)>> {
+        use std::io::Write;
+        const PARSE: &str = "import json, sys\nfrom halmos.solve import parse_model_str\nm = parse_model_str(sys.stdin.read())\nprint(json.dumps({k: [v.size_bits, str(v.value)] for k, v in m.items()}))";
+        // The Python the `halmos` command runs on, else python3.
+        let shebang = find_on_path("halmos")
+            .and_then(|h| std::fs::read_to_string(h).ok())
+            .and_then(|s| Some(s.lines().next()?.strip_prefix("#!")?.to_string()));
+        let mut cmd: Vec<String> = shebang
+            .as_deref()
+            .unwrap_or("python3")
+            .split_whitespace()
+            .map(String::from)
+            .collect();
+        cmd.extend(["-c".to_string(), PARSE.to_string()]);
+        let mut child = Command::new(&cmd[0])
+            .args(&cmd[1..])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+        child.stdin.take()?.write_all(out.as_bytes()).ok()?;
+        let o = child.wait_with_output().ok()?;
+        if !o.status.success() {
+            return None;
+        }
+        let m: std::collections::BTreeMap<String, (u32, String)> =
+            serde_json::from_slice(&o.stdout).ok()?;
+        Some(
+            m.into_iter()
+                .map(|(n, (w, v))| (n, w, v.parse().unwrap()))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn reads_what_halmos_reads() {
+        // Models as yices, z3 and bitwuzla write them, names quoted or not.
+        let outputs = [
+            "sat\n(define-fun p_x_uint8_abc1234_00 () (_ BitVec 8) #b11111111)\n(define-fun |p_y_uint8_abc1234_01| () (_ BitVec 8) #x07)\n",
+            "sat\n(\n  (define-fun |p_z[0]_uint256_abc1234_02| () (_ BitVec 256)\n    #x00000000000000000000000000000000000000000000000000000000000000ff)\n  (define-fun p_x_uint8_abc1234_00 () (_ BitVec 8)\n    #xFE)\n  (define-fun f_g ((x (_ BitVec 8))) (_ BitVec 8) x)\n  (define-fun p_b_bool_abc1234_03 () Bool true)\n)\n",
+            "sat\n(\n  (define-fun halmos_block_timestamp_depth1_abc1234 () (_ BitVec 64) (_ bv1700000000 64))\n  (define-fun |p_y_uint8_abc1234_01| () (_ BitVec 8) (_ bv256 8))\n  (define-fun other_uint8_abc1234_04 () (_ BitVec 8) #x01)\n)\n",
+        ];
+        let expected: [&[(&str, u32, u64)]; 3] = [
+            &[
+                ("p_x_uint8_abc1234_00", 8, 255),
+                ("p_y_uint8_abc1234_01", 8, 7),
+            ],
+            &[
+                ("p_x_uint8_abc1234_00", 8, 254),
+                ("p_z[0]_uint256_abc1234_02", 256, 255),
+            ],
+            &[
+                ("halmos_block_timestamp_depth1_abc1234", 64, 1_700_000_000),
+                ("p_y_uint8_abc1234_01", 8, 256),
+            ],
+        ];
+        let mut compared = 0;
+        for (out, want) in outputs.iter().zip(expected) {
+            let mut ours = read_model(out);
+            ours.sort();
+            let want: Vec<_> = want
+                .iter()
+                .map(|(n, w, v)| (n.to_string(), *w, BigUint::from(*v)))
+                .collect();
+            assert_eq!(ours, want, "{out}");
+            if let Some(mut theirs) = halmos_reads(out) {
+                theirs.sort();
+                assert_eq!(ours, theirs, "Halmos reads {out} differently");
+                compared += 1;
+            }
+        }
+        if compared == 0 {
+            eprintln!("not compared with Halmos's parser: Halmos's Python was not found");
+        }
+    }
+
+    #[test]
+    fn the_checks_of_one_answer_share_one_budget() {
+        // HALVES has an abstract division, so its unsat is checked twice: the
+        // abstract query (0.6 s here, sat), then the refined one, which this
+        // checker never answers. With 1 s for both, the refined query gets the
+        // 0.4 s left, and is stopped then.
+        fake_checker(r#"case "$1" in *refined*) exec sleep 10;; *) sleep 0.6; echo sat;; esac"#);
+        let f = query_file("budget", HALVES);
+        let o = Outcome {
+            answer: Answer::Unsat,
+            passthrough: None,
+            by: By::Rewrite,
+            rewrite_out: Some("unsat\n".into()),
+            run: None,
+        };
+        let twenty = Duration::from_secs(20);
+        let started = Instant::now();
+        let mut rec = Record::default();
+        let (a, _) = checked(
+            &f,
+            HALVES,
+            CheckMode::All,
+            o,
+            twenty,
+            Duration::from_secs(1),
+            started + twenty,
+            &mut rec,
+        )
+        .unwrap();
+        let took = started.elapsed();
+        assert!(
+            took >= Duration::from_millis(900) && took < Duration::from_millis(1400),
+            "{took:?}"
+        );
+        assert_eq!((a, rec.check.as_str()), (Answer::Unknown, "inconclusive"));
+        // A query with no time left gets no check at all.
+        let mut rec = Record::default();
+        let o = Outcome {
+            answer: Answer::Unsat,
+            passthrough: None,
+            by: By::Rewrite,
+            rewrite_out: Some("unsat\n".into()),
+            run: None,
+        };
+        let started = Instant::now();
+        let (a, _) = checked(
+            &f,
+            HALVES,
+            CheckMode::All,
+            o,
+            twenty,
+            twenty,
+            started,
+            &mut rec,
+        )
+        .unwrap();
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert_eq!((a, rec.check.as_str()), (Answer::Unknown, "inconclusive"));
+    }
+
+    #[test]
+    fn a_stopped_checker_stops_what_it_started() {
+        // A checker that is a script around the real work, here a sleep that
+        // ignores every time limit: the script waits for it, as a wrapper
+        // waits for its solver.
+        let dir = std::env::temp_dir().join(format!("ausweg-test-group-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pid_file = dir.join("pid");
+        let _ = std::fs::remove_file(&pid_file);
+        let script = format!("sleep 30 & echo $! > '{}'; wait", pid_file.display());
+        let cmd = vec!["sh".to_string(), "-c".to_string(), script, "--".to_string()];
+        let f = query_file("group", WRAPS);
+        let started = Instant::now();
+        let out = run_until(&cmd, &f, started + Duration::from_secs(1)).unwrap();
+        assert_eq!(out, None);
+        assert!(started.elapsed() < Duration::from_millis(1500));
+        let pid = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .to_string();
+        // Gone, or a zombie about to be reaped: either way, no longer running.
+        let running = || {
+            let o = Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid])
+                .output()
+                .unwrap();
+            let stat = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            !stat.is_empty() && !stat.starts_with('Z')
+        };
+        let by = Instant::now() + Duration::from_secs(2);
+        while running() && Instant::now() < by {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let still = running();
+        if still {
+            let _ = Command::new("kill").args(["-9", &pid]).status();
+        }
+        assert!(!still, "the checker's child {pid} still runs");
+    }
+
+    #[test]
+    fn the_rewrite_gets_the_overflow_right() {
+        if find_on_path("z3").is_none() {
+            eprintln!("skipped: z3 is not installed");
+            return;
+        }
+        let f = query_file("rewrite", OVERFLOWS);
+        let o = solve_unchecked(&f, Duration::from_secs(20)).unwrap();
+        assert_eq!(o.by, By::Rewrite);
+        assert!(matches!(o.answer, Answer::Sat(_)));
     }
 }

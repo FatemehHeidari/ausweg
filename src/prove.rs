@@ -42,9 +42,15 @@ pub struct ProveOptions {
     pub bound_amounts: bool,
     pub mutation: bool,
     pub max_mutants: usize,
-    /// `halmos --loop`: how far loops are unrolled. A check whose loops hit
-    /// the bound is reported as bounded, not proved.
+    /// `halmos --loop`: how far loops are unrolled. A check whose paths were
+    /// cut at the bound is reported as incomplete, not proved.
     pub loop_bound: Option<u32>,
+    /// Which of the integer rewrite's answers to check against the original
+    /// bit-vector query (Step 17).
+    pub check: crate::smt::CheckMode,
+    /// Seconds all the checks of one answer may take together, within the
+    /// query's own time (`--check-timeout`).
+    pub check_timeout: u64,
 }
 
 #[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
@@ -166,6 +172,12 @@ pub struct ProveReport {
     /// Why full_exit_proved is false.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub full_exit_withheld: Vec<String>,
+    /// Step 17: how many of the integer rewrite's answers were checked
+    /// against the original query, and what the checks found. The verdicts
+    /// above do not depend on it: a contradicted answer is replaced before
+    /// Halmos sees it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rewrite_check: Option<crate::smt::RewriteCheck>,
     pub seconds: f64,
     pub mutation: Option<ProofMutation>,
 }
@@ -891,6 +903,14 @@ pub struct Property {
 // ---------------------------------------------------------------- running
 
 /// What a run of Halmos says about each check; None when the build failed.
+/// Where `ausweg smt` logs what it did with each query of the proof run.
+fn smt_log(proof_contract: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "ausweg-smt-{}-{proof_contract}.jsonl",
+        std::process::id()
+    ))
+}
+
 fn run_halmos(
     repo: &Path,
     proof_contract: &str,
@@ -904,6 +924,20 @@ fn run_halmos(
     ));
     let _ = fs::remove_file(&json);
     let mut cmd = Command::new(&opts.halmos);
+    // A mutant needs no second opinion on the solver: checks there only cost time.
+    if early_exit {
+        cmd.env("AUSWEG_CHECK", "off").env_remove("AUSWEG_SMT_LOG");
+    } else {
+        let log = smt_log(proof_contract);
+        let _ = fs::remove_file(&log);
+        cmd.env("AUSWEG_CHECK", opts.check.to_env())
+            .env("AUSWEG_CHECK_TIMEOUT", opts.check_timeout.to_string())
+            .env("AUSWEG_SMT_LOG", &log)
+            .env(
+                "AUSWEG_SMT_SAVE_DIR",
+                repo.join("test/generated/rewrite-checks"),
+            );
+    }
     cmd.arg("--root")
         .arg(repo)
         .args(["--contract", proof_contract])
@@ -1327,6 +1361,15 @@ pub fn run(
     let Some(mut checks) = checks else {
         bail!("Halmos did not run the proof:\n{}", log_tail(&log));
     };
+    let rewrite_check = (opts.check != crate::smt::CheckMode::Off).then(|| {
+        let log = smt_log(&proof_contract);
+        let r = crate::smt::RewriteCheck::from_log(
+            opts.check,
+            &fs::read_to_string(&log).unwrap_or_default(),
+        );
+        let _ = fs::remove_file(&log);
+        r
+    });
     for c in checks
         .iter_mut()
         .filter(|c| c.verdict == Verdict::Counterexample)
@@ -1350,6 +1393,7 @@ pub fn run(
         withheld: v.liquidity,
         full_exit_proved: v.full_exit.as_ref().map(Vec::is_empty),
         full_exit_withheld: v.full_exit.unwrap_or_default(),
+        rewrite_check,
         seconds: 0.0,
         mutation: None,
     };
@@ -1433,9 +1477,11 @@ fn score(
     })
 }
 
-/// Runs Halmos in a process group of its own. Halmos starts each solver as its
-/// child; killing Halmos alone leaves them running, still using CPU and memory.
-fn own_group(cmd: &mut Command) {
+/// Runs a command in a process group of its own, so it can be stopped with
+/// everything it starts: Halmos starts each solver as its child, and a checker
+/// may be a script around one. Killing the command alone leaves them running,
+/// still using CPU and memory.
+pub(crate) fn own_group(cmd: &mut Command) {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -1443,8 +1489,9 @@ fn own_group(cmd: &mut Command) {
     }
 }
 
-/// Stops Halmos and every solver still running in its group.
-fn stop_group(child: &mut std::process::Child) {
+/// Stops a command started with `own_group`, and everything still running in
+/// its group. Only that group is signalled, never the caller's.
+pub(crate) fn stop_group(child: &mut std::process::Child) {
     #[cfg(unix)]
     // SAFETY: killpg only sends a signal, to the group `own_group` made.
     unsafe {
@@ -1566,8 +1613,10 @@ fn bench_one(
         cmd.args(["--loop", &n.to_string()]);
     }
     if solver == "ausweg" {
+        // The checks would add a second solver's time to ausweg's.
         cmd.arg("--solver-command")
             .arg(format!("{} smt", exe.display()))
+            .env("AUSWEG_CHECK", "off")
             .env(
                 "AUSWEG_SMT_TIMEOUT",
                 opts.solver_timeout.saturating_sub(5).max(1).to_string(),

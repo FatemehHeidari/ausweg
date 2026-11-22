@@ -137,9 +137,26 @@ enum Cmd {
         #[arg(long)]
         bound_amounts: bool,
         /// `halmos --loop`: how far loops are unrolled (Halmos's default is 2).
-        /// A check whose loops hit the bound is reported as bounded, not proved.
+        /// A check whose paths were cut at the bound is reported as incomplete,
+        /// not proved.
         #[arg(long = "loop")]
         loop_bound: Option<u32>,
+        /// Check the integer rewrite's answers against the original bit-vector
+        /// query: `sample` (every model, and the unsat answers a seeded hash
+        /// picks), `all` (every model and every unsat), or `off`. A model the
+        /// checks cannot confirm becomes unknown; so does an unsat with `all`.
+        #[arg(long, value_parser = ["sample", "all", "off"], default_value = "sample")]
+        check_rewrite: String,
+        /// With `--check-rewrite sample`: check one unsat answer in this many.
+        #[arg(long, default_value_t = 16)]
+        check_every: u64,
+        /// With `--check-rewrite sample`: the seed that picks them.
+        #[arg(long, default_value_t = 0)]
+        check_seed: u64,
+        /// Seconds all the checks of one answer may take together, within the
+        /// query's own time; a check that runs out is inconclusive.
+        #[arg(long, default_value_t = 10)]
+        check_timeout: u64,
         /// Upper bound on mutants per contract, taken in source order.
         #[arg(long, default_value_t = 100)]
         max_mutants: usize,
@@ -419,11 +436,23 @@ fn main() -> Result<()> {
             no_price,
             bound_amounts,
             loop_bound,
+            check_rewrite,
+            check_every,
+            check_seed,
+            check_timeout,
             max_mutants,
             no_mutation,
             forge_bin,
             json,
         } => {
+            let check = match check_rewrite.as_str() {
+                "off" => smt::CheckMode::Off,
+                "all" => smt::CheckMode::All,
+                _ => smt::CheckMode::Sample {
+                    every: check_every.max(1),
+                    seed: check_seed,
+                },
+            };
             let forge = forge::ForgeCli {
                 bin: forge_bin.clone(),
                 fuzz_seed: None,
@@ -438,6 +467,8 @@ fn main() -> Result<()> {
                 mutation: !no_mutation,
                 max_mutants,
                 loop_bound,
+                check,
+                check_timeout,
             };
             let mut reports = Vec::new();
             let mut failed = Vec::new();
@@ -480,6 +511,42 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Step 17's line: how many of the rewrite's answers were checked, and what
+/// the checks found.
+fn print_rewrite_check(c: &smt::RewriteCheck) {
+    let mode = smt::CheckMode::from_env_value(&c.mode)
+        .map(|m| m.describe())
+        .unwrap_or_else(|| c.mode.clone());
+    let unchecked = c.rewrite_unsat - c.checked;
+    println!(
+        "- rewrite check ({mode}): {} unsat answers came from the integer rewrite; {} checked against the original query: {} confirmed, {} inconclusive, {} contradicted; {} rest on the rewrite alone. {} sat models checked: {} invalid, {} inconclusive; {} left to Halmos's own refinement. {} answers came from a bit-vector solver directly",
+        c.rewrite_unsat,
+        c.checked,
+        c.confirmed,
+        c.inconclusive,
+        c.contradicted,
+        unchecked,
+        c.models_checked,
+        c.models_invalid,
+        c.models_inconclusive,
+        c.models_discarded,
+        c.bit_vector,
+    );
+    if c.made_unknown > 0 {
+        println!(
+            "- {} answers became unknown: the checks could not confirm them, or found them wrong with nothing confirmed to replace them",
+            c.made_unknown
+        );
+    }
+    if c.disagreements() > 0 {
+        println!(
+            "- {} ANSWERS DISAGREED with the original query and were not passed on. Saved: {}",
+            c.disagreements(),
+            c.saved.join(", ")
+        );
+    }
 }
 
 fn print_proof_summary(r: &prove::ProveReport) {
@@ -600,6 +667,9 @@ fn print_proof_summary(r: &prove::ProveReport) {
         })
         .collect();
     println!("- keeps checks for: {}", keeps.join(", "));
+    if let Some(c) = &r.rewrite_check {
+        print_rewrite_check(c);
+    }
     if !r.left_out.is_empty() {
         println!("- left out by the model: {}", r.left_out.join(", "));
     }
