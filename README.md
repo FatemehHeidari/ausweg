@@ -90,6 +90,10 @@ GitHub Actions checks formatting and Clippy, and runs the Rust tests on Rust
 The test jobs install Halmos 0.3.3, z3 4.12.6 and yices 2.6.4; missing yices
 or a skipped comparison with Halmos's real model parser fails CI.
 
+CI also runs the evaluation runner's regression tests and checks its Python
+and shell syntax. The runner's tests need Linux and Python 3.11 or later, with
+nothing outside its standard library; CI runs them on Python 3.12.
+
 The suite uses stand-ins for Foundry and the LLM, and real solvers for the SMT
 regressions. Full vault proofs and benchmarks are separate from these checks.
 
@@ -101,6 +105,12 @@ cargo +1.88.0 clippy --locked --all-targets -- -D warnings
 cargo +1.88.0 clippy --locked --all-targets --all-features -- -D warnings
 CI=true cargo test --locked --all-targets -- --test-threads=1
 CI=true cargo test --locked --all-targets --all-features -- --test-threads=1
+```
+
+On Linux, also run the evaluation runner's tests:
+
+```sh
+python3 -I eval/test_runner.py
 ```
 
 ## Usage
