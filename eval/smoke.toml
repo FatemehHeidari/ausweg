@@ -1,0 +1,63 @@
+# The runner's smoke test, on the demo vaults in examples/ and eval/smoke/.
+# Build its project first: eval/smoke/make_project.sh /tmp/eval-smoke/project
+# Each target says what it must show; eval/smoke_check.py reads the results
+# against it. test_hooks change limits or run a subset of checks, for these
+# tests only.
+
+[[target]]
+id = "proved-and-gambit"
+project = "/tmp/eval-smoke/project"
+contract = "src/SolmateVault.sol"
+label = "correct demo"
+mutate = true
+expect = { class = "proved", confirmed_kill = true, linked_dependency_mutated = true }
+# The smoke test needs one complete Gambit case: it stops at its first
+# confirmed kill instead of running every mutant.
+test_hooks = { stop_after_confirmed_kills = 1 }
+
+[[target]]
+id = "known-bug"
+project = "/tmp/eval-smoke/project"
+contract = "src/SolmateVaultBug.sol"
+label = "known bug: convertToAssets rounds up"
+expect = { class = "confirmed counterexample", confirmed = ["check_exit_withdraw"] }
+
+[[target]]
+id = "solver-timeout"
+project = "/tmp/eval-smoke/project"
+contract = "src/OZVault.sol"
+label = "time limits: a five-second solver query limit on OpenZeppelin's 512-bit mulDiv"
+expect = { checks = { check_keeps_mint = "timeout" } }
+test_hooks = { only_checks = ["check_keeps_mint"], limits = { query_seconds = 5 } }
+
+[[target]]
+id = "check-cap"
+project = "/tmp/eval-smoke/project"
+contract = "src/SolmateVault.sol"
+label = "time limits: a 15-second cap on one check"
+expect = { checks = { check_keeps_deposit = "unfinished" }, wrapper_stopped_processes = true }
+test_hooks = { only_checks = ["check_keeps_deposit"], limits = { check_seconds = 15 } }
+
+[[target]]
+id = "target-budget"
+project = "/tmp/eval-smoke/project"
+contract = "src/SolmateVault.sol"
+label = "time limits: a 25-second budget for the whole target"
+expect = { class = "unfinished" }
+test_hooks = { limits = { target_seconds = 25 } }
+
+[[target]]
+id = "runner-stop"
+project = "/tmp/eval-smoke/project"
+contract = "src/SolmateVault.sol"
+label = "time limits: the runner stops ausweg, Halmos and the solvers mid-check"
+expect = { class = "unfinished", runner_stopped_processes = true }
+test_hooks = { only_checks = ["check_keeps_deposit"], runner_seconds = 20 }
+
+[[target]]
+id = "loop-bound"
+project = "/tmp/eval-smoke/project"
+contract = "src/LoopVault.sol"
+label = "incomplete: Halmos's loop bound cuts paths of ping"
+expect = { checks = { check_keeps_ping = "incomplete" } }
+test_hooks = { only_checks = ["check_keeps_ping"] }
