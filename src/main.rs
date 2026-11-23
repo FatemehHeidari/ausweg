@@ -26,7 +26,7 @@ use std::time::Duration;
 #[derive(Parser)]
 #[command(
     version,
-    about = "Proves every user can always get out of an ERC-4626 or ERC-7540 vault; also writes Foundry property tests with an LLM"
+    about = "Writes Foundry property tests with a local LLM, and checks built-in exit properties of supported ERC-4626 and ERC-7540 vaults with Halmos, in the model the README states"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -113,7 +113,8 @@ enum Cmd {
         #[command(flatten)]
         check: CheckArgs,
     },
-    /// Step 13: prove that every user can always get out of an ERC-4626 vault.
+    /// Steps 13 and 15: check built-in exit properties of a supported ERC-4626 or
+    /// ERC-7540 vault with Halmos, in the model the README states.
     /// Needs Halmos, and z3 for the integer back end.
     Prove {
         /// Foundry project root.
@@ -131,9 +132,9 @@ enum Cmd {
         /// Leave "share price >= 1" out of the invariant.
         #[arg(long)]
         no_price: bool,
-        /// Limit every amount argument to 2^128. Larger amounts exceed any
-        /// balance under the 2^96 supply cap; leaving them out keeps the solver
-        /// away from mulDiv's 512-bit branch.
+        /// Limit every unsigned integer argument to 2^128, amounts and others
+        /// alike. Larger amounts exceed any balance under the 2^96 supply cap;
+        /// leaving them out keeps the solver away from mulDiv's 512-bit branch.
         #[arg(long)]
         bound_amounts: bool,
         /// `halmos --loop`: how far loops are unrolled (Halmos's default is 2).
@@ -199,7 +200,7 @@ enum Cmd {
         /// Wall-clock seconds one check may take with one solver.
         #[arg(long, default_value_t = 600)]
         cap: u64,
-        /// Limit every amount argument to 2^128, as `ausweg prove --bound-amounts`.
+        /// Limit every unsigned integer argument to 2^128, as `ausweg prove --bound-amounts`.
         #[arg(long)]
         bound_amounts: bool,
         #[arg(long, default_value = "halmos")]

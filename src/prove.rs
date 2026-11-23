@@ -38,7 +38,7 @@ pub struct ProveOptions {
     pub solver_timeout: u64,
     /// Include "share price >= 1" in the invariant.
     pub price: bool,
-    /// Limit every amount argument to 2^128.
+    /// Limit every unsigned integer argument to 2^128.
     pub bound_amounts: bool,
     pub mutation: bool,
     pub max_mutants: usize,

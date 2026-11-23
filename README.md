@@ -2,7 +2,7 @@
 
 `ausweg` writes Foundry property tests for Solidity contracts with a local LLM, and scores them against injected bugs. It also proves built-in exit properties of supported ERC-4626 and ERC-7540 vaults with [Halmos](https://github.com/a16z/halmos), using its own integer-arithmetic solver back end; the proofs involve no LLM. A proof holds for the model and assumptions stated below. Neither part takes a specification from you: the exit properties are built in, and the LLM writes its own tests.
 
-For a supported vault, `ausweg prove` proves that every user can always get out, or reports a counterexample, or withholds the verdict and says why. It writes the proof from the vault's ABI and one concrete run of the vault.
+For a supported ERC-4626 vault, `ausweg prove` proves that every user can always get out, or reports a counterexample, or withholds the verdict and says why; for an ERC-7540 vault, it proves each stage of the exit on its own. It writes the proof from the vault's ABI and one concrete run of the vault.
 
 The proof is about a model of the vault's world: three users and the owner, and a plain ERC-20 asset (no fees, blocklists or pauses) with a supply of at most 2^96. In it, from every reachable state, each user can redeem every share they hold in one call, for at least what `previewRedeem` quoted; whether that quote is fair is not checked. In an ERC-7540 vault, each of the three steps (request, fulfilment or a delay, claim) is proved on its own, and so is that no other user, nor the owner, can shrink a request or lower the share price, unless the user gave them an allowance or operator rights. That the steps add up to one exit, if the owner eventually fulfils requests, is argued from them, not checked. Ownership changes and calls that need a signature are left out.
 
@@ -102,7 +102,7 @@ Score a test file you already have, without the model:
 ausweg score --contract src/Vault.sol --test test/Vault.t.sol
 ```
 
-Prove that every user can always get out of a supported vault:
+Check the built-in exit properties of a supported vault:
 
 ```sh
 ausweg prove --contract src/SolmateVault.sol --json ausweg-proof.json
@@ -224,7 +224,7 @@ Since 0.7.0, a check that Halmos passes without exploring every path is incomple
 
 The invariant: alice, bob and carol, plus any address the constructor takes (a fee treasury), hold every share and every asset token, the vault holding its own assets; the asset's supply is at most 2^96; and the share price is at least 1, `totalAssets() >= totalSupply()`. `--no-price` leaves the last part out: on Solmate the exit check then fails, because a share worth less than one asset unit redeems to 0 and Solmate's `redeem` reverts with `ZERO_ASSETS`.
 
-`--bound-amounts` limits every amount argument to 2^128. No balance can exceed the 2^96 supply cap, so larger amounts can only revert, except in `approve`; there the bound narrows only `keeps approve`, since storage is symbolic and every other check starts from any allowance. Leaving them out keeps the solver away from OpenZeppelin's and Solady's 512-bit `mulDiv` branch, where a product needs more than 256 bits. On the bench, OZVault's `keeps mint` times out without it and is proved with it.
+`--bound-amounts` limits every unsigned integer argument to 2^128, amounts and others alike. No balance can exceed the 2^96 supply cap, so larger amounts can only revert, except in `approve`; there the bound narrows only `keeps approve`, since storage is symbolic and every other check starts from any allowance. Leaving them out keeps the solver away from OpenZeppelin's and Solady's 512-bit `mulDiv` branch, where a product needs more than 256 bits. On the bench, OZVault's `keeps mint` times out without it and is proved with it.
 
 A constructor address that is not the asset (OZFeeVault's treasury) gets a fixed address in the proof. Halmos models `makeAddr` as an unknown function, so with it the solver can make the treasury equal to a user, and the fee then lands in the user's own balance.
 
