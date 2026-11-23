@@ -437,6 +437,21 @@ impl Graph {
             if head == "as" && fl.get(1).and_then(|x| x.atom()) == Some("const") {
                 let sort = parse_sort(&fl[2])?;
                 let v = self.term(&l[1])?;
+                // The integer model of an array is 0 outside the bit-vector
+                // index range. A constant array with another value differs
+                // from it there, so an array equality that holds over bit
+                // vectors could fail over integers. Such a query goes to the
+                // bit-vector solver unchanged.
+                let zero = match &self.nodes[v].op {
+                    Op::Lit(x) => x.is_zero(),
+                    Op::Bool(b) => !b,
+                    // Only zero constant arrays get this far.
+                    Op::ConstArray => true,
+                    _ => false,
+                };
+                if !zero {
+                    bail!("as const: a constant array with a nonzero value is not translated");
+                }
                 return Ok(self.add(Op::ConstArray, vec![v], sort));
             }
             bail!("unsupported application head {first:?}");
@@ -451,12 +466,15 @@ impl Graph {
             return Ok(self.add(Op::Evm(f), args, sort));
         }
         if let Some(m) = self.macros.get(&f) {
+            // The arguments were read in the caller's scope above. The body
+            // sees its parameters and the global definitions only: a `let` at
+            // the call site must not rebind a name the body uses.
             let scope: HashMap<String, usize> =
                 m.params.iter().cloned().zip(args.iter().copied()).collect();
             let body = m.body.clone();
-            self.scopes.push(scope);
+            let caller = std::mem::replace(&mut self.scopes, vec![scope]);
             let r = self.term(&body);
-            self.scopes.pop();
+            self.scopes = caller;
             return r;
         }
         if let Some((_, ret)) = self.funs.get(&f).cloned() {
@@ -3983,5 +4001,90 @@ mod tests {
         let o = solve_unchecked(&f, Duration::from_secs(20)).unwrap();
         assert_eq!(o.by, By::Rewrite);
         assert!(matches!(o.answer, Answer::Sat(_)));
+    }
+
+    // Step 20, first gap. With a 1-bit index, two stores overwrite a constant
+    // array at both of its indices, so the equality holds and the query is sat.
+    // Translated, the integer array still holds the constant 1 at every other
+    // integer, the equality fails, and the rewrite answered unsat: a false proof.
+    // The logic is ALL because QF_AUFBV has no constant arrays, and z3 rejects
+    // them there.
+    const NONZERO_CONST_ARRAY: &str = "(set-logic ALL)\n(declare-fun p_x () (_ BitVec 8))\n\
+        (assert (= p_x #x00))\n\
+        (assert (= (store (store ((as const (Array (_ BitVec 1) (_ BitVec 8))) #x01) #b0 p_x) #b1 p_x) \
+        ((as const (Array (_ BitVec 1) (_ BitVec 8))) #x00)))\n(check-sat)\n(get-model)\n";
+
+    #[test]
+    fn a_nonzero_constant_array_goes_to_the_bit_vector_solver() {
+        if let Some(z3) = find_on_path("z3") {
+            let f = query_file("const-array", NONZERO_CONST_ARRAY);
+            // z3, reading the query itself, finds it sat.
+            let direct = run(&[z3.display().to_string()], &f).unwrap();
+            assert_eq!(first_line(&direct), "sat");
+            // The answer, with nothing checking it, is never unsat. It is the
+            // bit-vector solver's answer on the unchanged query; yices, the
+            // first choice, cannot read `as const`, so here it is unknown.
+            let o = solve_unchecked(&f, Duration::from_secs(20)).unwrap();
+            assert!(
+                !matches!(o.answer, Answer::Unsat),
+                "answer {:?} by {:?}",
+                o.answer,
+                o.by
+            );
+            assert_eq!(o.by, By::BitVector);
+            let (bv, _, _) = bit_vector(&f, Duration::from_secs(20), false).unwrap();
+            assert_eq!(o.answer, bv);
+        } else {
+            eprintln!("skipped the solver run: z3 is not installed");
+        }
+        assert_eq!(
+            read(NONZERO_CONST_ARRAY).unwrap_err(),
+            "as const: a constant array with a nonzero value is not translated"
+        );
+        // A zero constant array is still translated: every array of the integer
+        // model Step 20 builds is 0 outside its index range.
+        let zero = NONZERO_CONST_ARRAY.replace("#x01) #b0", "#x00) #b0");
+        assert!(read(&zero).is_ok());
+        let flag = "(declare-fun a () (Array (_ BitVec 8) Bool))\n\
+                    (assert (= a ((as const (Array (_ BitVec 8) Bool)) true)))\n(check-sat)\n";
+        assert!(read(flag).is_err());
+        assert!(read(&flag.replace(" true)", " false)")).is_ok());
+    }
+
+    // Step 20, second gap. The macro's body names the global p_x, and at the
+    // call site a `let` binds another p_x. The body must read the global, so
+    // the query is sat with p_x = 2. Expanded in the caller's scope, the body
+    // read the local p_x = 1, the second assertion became false, and the
+    // rewrite answered unsat: a false proof. The third assertion holds only
+    // if the argument is read in the caller's scope.
+    const CAPTURED_MACRO: &str = "(set-logic QF_AUFBV)\n(declare-fun p_x () (_ BitVec 8))\n\
+        (define-fun is_x ((y (_ BitVec 8))) Bool (= y p_x))\n\
+        (assert (= p_x #x02))\n\
+        (assert (let ((p_x #x01)) (is_x #x02)))\n\
+        (assert (let ((p_x #x03)) (not (is_x p_x))))\n\
+        (check-sat)\n(get-model)\n";
+
+    #[test]
+    fn a_macro_body_reads_global_names_not_the_callers_lets() {
+        // The answer itself, with nothing checking it.
+        if find_on_path("z3").is_some() {
+            let f = query_file("macro", CAPTURED_MACRO);
+            let o = solve_unchecked(&f, Duration::from_secs(20)).unwrap();
+            assert!(
+                matches!(o.answer, Answer::Sat(_)),
+                "answer {:?} by {:?}",
+                o.answer,
+                o.by
+            );
+            assert_eq!(o.by, By::Rewrite);
+        } else {
+            eprintln!("skipped the solver run: z3 is not installed");
+        }
+        // The body compares with the global p_x: 2 from the first call, and the
+        // caller's local 3 from the second.
+        let t = translate_src(CAPTURED_MACRO);
+        assert!(t.script.contains("(= 2 p_x)"), "{}", t.script);
+        assert!(t.script.contains("(= 3 p_x)"), "{}", t.script);
+        assert!(!t.script.contains("(= 2 1)"), "{}", t.script);
     }
 }
