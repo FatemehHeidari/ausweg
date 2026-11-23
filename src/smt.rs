@@ -3389,6 +3389,9 @@ mod tests {
 
     fn have_yices() -> bool {
         let found = find_on_path("yices-smt2").is_some();
+        if std::env::var_os("CI").is_some() {
+            assert!(found, "CI requires yices-smt2; solver checks must not skip");
+        }
         if !found {
             eprintln!("skipped: yices-smt2 is not installed");
         }
@@ -3886,7 +3889,13 @@ mod tests {
                 compared += 1;
             }
         }
-        if compared == 0 {
+        if std::env::var_os("CI").is_some() {
+            assert_eq!(
+                compared,
+                outputs.len(),
+                "CI must compare every fixture with Halmos's real parser"
+            );
+        } else if compared == 0 {
             eprintln!("not compared with Halmos's parser: Halmos's Python was not found");
         }
     }

@@ -1,5 +1,7 @@
 # ausweg
 
+[![CI](https://github.com/FatemehHeidari/ausweg/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/FatemehHeidari/ausweg/actions/workflows/ci.yml)
+
 `ausweg` writes Foundry property tests for Solidity contracts with a local LLM, and scores them against injected bugs. It also proves built-in exit properties of supported ERC-4626 and ERC-7540 vaults with [Halmos](https://github.com/a16z/halmos), using its own integer-arithmetic solver back end; the proofs involve no LLM. A proof holds for the model and assumptions stated below. Neither part takes a specification from you: the exit properties are built in, and the LLM writes its own tests.
 
 For a supported ERC-4626 vault, `ausweg prove` proves that every user can always get out, or reports a counterexample, or withholds the verdict and says why; for an ERC-7540 vault, it proves each stage of the exit on its own. It writes the proof from the vault's ABI and one concrete run of the vault.
@@ -79,6 +81,27 @@ Step 16 runs that proof on [OpenZeppelin's ERC-7540](https://docs.openzeppelin.c
 - For `ausweg baseline` and `ausweg invariants` only: [Ollama](https://ollama.com) with a coding model pulled, e.g. `ollama pull qwen2.5-coder:14b`
 - Rust 1.88+ (edition 2024) to build: the code uses let chains, stable since 1.88
 - For `ausweg prove` only: Halmos (`halmos` on `PATH`) and z3 (`z3` on `PATH`). `pipx install --include-deps halmos` puts both on `PATH`; so does `pip install halmos`, since Halmos depends on z3.
+
+## Development checks
+
+GitHub Actions checks formatting and Clippy, and runs the Rust tests on Rust
+1.88.0 and current stable, with default features and with `--all-features`
+(including fault injection). Every Cargo build uses the committed lockfile.
+The test jobs install Halmos 0.3.3, z3 4.12.6 and yices 2.6.4; missing yices
+or a skipped comparison with Halmos's real model parser fails CI.
+
+The suite uses stand-ins for Foundry and the LLM, and real solvers for the SMT
+regressions. Full vault proofs and benchmarks are separate from these checks.
+
+To run the same checks locally, with the solver tools installed:
+
+```sh
+cargo +1.88.0 fmt --all -- --check
+cargo +1.88.0 clippy --locked --all-targets -- -D warnings
+cargo +1.88.0 clippy --locked --all-targets --all-features -- -D warnings
+CI=true cargo test --locked --all-targets -- --test-threads=1
+CI=true cargo test --locked --all-targets --all-features -- --test-threads=1
+```
 
 ## Usage
 

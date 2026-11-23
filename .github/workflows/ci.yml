@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  quality:
+    name: Formatting and Clippy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.88
+        run: rustup toolchain install 1.88.0 --profile minimal --component rustfmt --component clippy
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-quality-1.88.0-${{ hashFiles('Cargo.lock') }}
+
+      - name: Check formatting
+        run: cargo +1.88.0 fmt --all -- --check
+
+      - name: Clippy (default features)
+        run: cargo +1.88.0 clippy --locked --all-targets -- -D warnings
+
+      - name: Clippy (all features)
+        run: cargo +1.88.0 clippy --locked --all-targets --all-features -- -D warnings
+
+  test:
+    name: Tests (Rust ${{ matrix.rust }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: ["1.88.0", "stable"]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install Rust
+        run: rustup toolchain install "${{ matrix.rust }}" --profile minimal
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-test-${{ matrix.rust }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Install solver test dependencies
+        run: |
+          python -m pip install --disable-pip-version-check \
+            halmos==0.3.3 z3-solver==4.12.6.0 yices-solver==2.6.4.post23
+          python -m pip check
+
+      - name: Verify solvers and Halmos parser are available
+        run: |
+          z3 --version
+          yices-smt2 --version
+          halmos --version
+          python -c 'from halmos.solve import parse_model_str; import z3; print("Halmos parser ready; Z3", z3.get_version_string())'
+
+      # Timing and process-cleanup regressions run sequentially.
+      - name: Test (default features)
+        run: cargo +${{ matrix.rust }} test --locked --all-targets -- --test-threads=1
+
+      - name: Test (all features, including fault injection)
+        run: cargo +${{ matrix.rust }} test --locked --all-targets --all-features -- --test-threads=1
