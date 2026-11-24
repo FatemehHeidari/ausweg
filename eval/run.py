@@ -55,6 +55,8 @@ MIN_START = 5  # a step with less time left than this is not started
 # one, such as AUSWEG_SMT_SOLVER, is dropped.
 KEEP_ENV = ("HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TMPDIR", "TERM")
 SHIMS = {"forge": "forge", "halmos": "halmos", "z3": "z3", "yices-smt2": "yices"}
+# Every tool a manifest records, each with its path and sha256.
+TOOLS = ("ausweg", "gambit", *SHIMS, "python3")
 
 REFUSALS = [
     r"not an ERC-4626 vault ausweg can prove",

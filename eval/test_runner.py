@@ -353,6 +353,8 @@ class ResumeAndShard(Tmp):
         write(self.p("proj", "src", "V.sol"), "contract V {}\n")
         self.targets()
         self.ran = []
+        self.tools = {name: {"path": f"/opt/ausweg-eval/bin/{name}", "sha256": "ab" * 32, "reported": None}
+                      for name in runner.TOOLS}
 
     def targets(self, contract="src/V.sol"):
         write(self.p("targets.toml"), "".join(
@@ -368,7 +370,7 @@ class ResumeAndShard(Tmp):
     def main(self, *extra, out="out"):
         argv = ["--config", self.p("config.toml"), "--targets", self.p("targets.toml"), "--out", self.p(out), *extra]
         with mock.patch.object(runner, "Run", lambda cfg, out: mock.Mock(out=out, base_env={})), \
-                mock.patch.object(runner, "tool_versions", lambda run: ({}, [])), \
+                mock.patch.object(runner, "tool_versions", lambda run: (self.tools, [])), \
                 mock.patch.object(runner, "run_target", self.fake_target):
             runner.main(argv)
 
@@ -438,6 +440,31 @@ class ResumeAndShard(Tmp):
         self.main("--shard", "2/2", out="s2")
         with self.assertRaises(SystemExit):
             self.merge("s1", "s2")
+
+    def test_a_merge_refuses_binaries_that_differ_or_were_not_recorded(self):
+        """Gambit reports no version, so shards that ran two different Gambit
+        binaries passed the version check and merged. So did shards with no
+        hash or no record of a tool, the first shard included."""
+        tools = self.tools
+
+        def shards(prefix, gambit):
+            self.tools = {n: t for n, t in tools.items() if n != "gambit"}
+            if gambit:
+                self.tools["gambit"] = gambit
+            self.main("--shard", "1/2", out=prefix + "1")
+            self.main("--shard", "2/2", out=prefix + "2")
+        shards("same", tools["gambit"])
+        shards("other", dict(tools["gambit"], sha256="f96889c8" * 8))
+        shards("unhashed", dict(tools["gambit"], sha256=None))
+        shards("unrecorded", None)
+        self.merge("same1", "same2")
+        self.merge("other1", "other2")
+        for pair in (("same1", "other2"), ("other1", "same2"), ("unhashed1", "unhashed2"),
+                     ("unrecorded1", "unrecorded2"), ("unrecorded1", "same2"), ("same1", "unrecorded2")):
+            with self.subTest(pair=pair):
+                with self.assertRaises(SystemExit) as e:
+                    self.merge(*pair)
+                self.assertIn("gambit", str(e.exception))
 
 
 if __name__ == "__main__":

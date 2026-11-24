@@ -3,9 +3,11 @@
 
     python3 -I eval/merge.py --targets <targets.toml> --out <merged dir> <shard dir> ...
 
-Refuses shards whose settings, targets file, runner commit or tool versions
-differ, and a target that is missing or present twice. Tool binaries built on
-each machine may differ by hash; the summary lists each shard's.
+Refuses shards whose settings, targets file, runner commit, tool versions or
+tool binaries differ; any shard, the first included, with no record or no
+sha256 of a tool; and a target that is missing or present twice. Binaries are
+compared by sha256: one version built on two machines need not be the same
+bytes. The summary lists each shard's.
 """
 
 import argparse
@@ -14,6 +16,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import files  # noqa: E402
+import run  # noqa: E402
 
 
 def first_manifest(d):
@@ -29,7 +32,7 @@ def main(argv=None):
     a = ap.parse_args(argv)
     ids = [t["id"] for t in files.read_toml(a.targets)["target"]]
     manifests = {d: first_manifest(d) for d in a.shards}
-    ref = next(iter(manifests.values()))
+    ref_dir, ref = next(iter(manifests.items()))
     problems = []
     want = files.sha256(a.targets)
     for d, m in manifests.items():
@@ -40,8 +43,17 @@ def main(argv=None):
                 problems.append(f"{d}: {key} differs")
         if m["runner"] != ref["runner"]:
             problems.append(f"{d}: runner commit differs")
-        for name, tool in m["tools"].items():
-            if tool.get("reported") != ref["tools"].get(name, {}).get("reported"):
+        for name in sorted(set(run.TOOLS) | set(m["tools"]) | set(ref["tools"])):
+            tool, was = m["tools"].get(name), ref["tools"].get(name) or {}
+            if tool is None:
+                problems.append(f"{d}: no record of {name}")
+                continue
+            if not tool.get("sha256"):
+                problems.append(f"{d}: {name} has no sha256")
+            elif tool["sha256"] != was.get("sha256"):
+                problems.append(f"{d}: {name} is not the binary {ref_dir} ran: sha256 "
+                                f"{tool['sha256'][:12]}, against {(was.get('sha256') or 'none')[:12]}")
+            if tool.get("reported") != was.get("reported"):
                 problems.append(f"{d}: {name} reports {tool.get('reported')!r}")
     results, where = {}, {}
     for d in a.shards:

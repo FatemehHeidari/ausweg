@@ -26,8 +26,13 @@ It refuses to continue if the settings, targets file, tools, runner commit or
 shard changed, or if a finished target's project, dependencies included, no
 longer hashes as it did when the target ran. `merge.py` refuses shards that
 ran another targets file than the one it is given, shards that differ from
-each other, and a target that is missing or present twice. Start the run
-inside `tmux` so it outlives the SSH session.
+each other, and a target that is missing or present twice. Shards differ if
+any tool's sha256 does: one version built on two VMs need not be the same
+bytes. A shard, the first included, with no record or no hash of a tool is
+refused too. So before starting the shards, compare
+`sha256sum /opt/ausweg-eval/bin/*` across the VMs, and if ausweg's or Gambit's
+builds differ, copy one VM's binaries to the others. Start the run inside
+`tmux` so it outlives the SSH session.
 
 ```sh
 python3 -I eval/run.py --config eval/config.toml --targets <targets.toml> --out /srv/eval --shard 2/6 --resume
