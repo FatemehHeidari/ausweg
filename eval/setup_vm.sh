@@ -32,12 +32,23 @@ git -C "$prefix/src/ausweg" checkout -q "$commit"
 cargo build -q --release --locked --manifest-path "$prefix/src/ausweg/Cargo.toml"
 cp "$prefix/src/ausweg/target/release/ausweg" "$prefix/bin/ausweg"
 
-# Gambit v1.0.7.
-cargo install -q --locked --git https://github.com/Certora/gambit --tag v1.0.7 --root "$prefix"
+# Gambit v1.0.7, with the dependency versions in eval/gambit-Cargo.lock: its
+# tag ships no lockfile, so cargo install would resolve them anew on every
+# machine. The smoke-tested binary was built from these versions.
+gambit_commit=072ff4c6d747397f859e0a15a20fe1ff05672332
+if [ ! -d "$prefix/src/gambit" ]; then
+    git clone -q https://github.com/Certora/gambit "$prefix/src/gambit"
+fi
+git -C "$prefix/src/gambit" checkout -q "$gambit_commit"
+cp "$prefix/src/ausweg/eval/gambit-Cargo.lock" "$prefix/src/gambit/Cargo.lock"
+cargo build -q --release --locked --manifest-path "$prefix/src/gambit/Cargo.toml"
+cp "$prefix/src/gambit/target/release/gambit" "$prefix/bin/gambit"
 
-# Halmos 0.3.3, with the z3 and yices it pins.
+# Halmos 0.3.3, with the z3 and yices it pins and every other package it
+# needs, at the versions in eval/requirements-halmos.txt.
 python3 -m venv "$prefix/venv"
-"$prefix/venv/bin/pip" install -q halmos==0.3.3 z3-solver==4.12.6.0 yices-solver==2.6.4.post23
+"$prefix/venv/bin/pip" install -q --disable-pip-version-check --no-deps -r "$prefix/src/ausweg/eval/requirements-halmos.txt"
+"$prefix/venv/bin/pip" check
 
 # Foundry 1.9.0, checked against the release the smoke test used.
 curl -sSfL -o /tmp/foundry.tgz \

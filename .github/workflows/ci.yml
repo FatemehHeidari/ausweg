@@ -81,8 +81,7 @@ jobs:
 
       - name: Install solver test dependencies
         run: |
-          python -m pip install --disable-pip-version-check \
-            halmos==0.3.3 z3-solver==4.12.6.0 yices-solver==2.6.4.post23
+          python -m pip install --disable-pip-version-check --no-deps -r eval/requirements-halmos.txt
           python -m pip check
 
       - name: Verify solvers and Halmos parser are available

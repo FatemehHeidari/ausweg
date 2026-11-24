@@ -87,8 +87,10 @@ Step 16 runs that proof on [OpenZeppelin's ERC-7540](https://docs.openzeppelin.c
 GitHub Actions checks formatting and Clippy, and runs the Rust tests on Rust
 1.88.0 and current stable, with default features and with `--all-features`
 (including fault injection). Every Cargo build uses the committed lockfile.
-The test jobs install Halmos 0.3.3, z3 4.12.6 and yices 2.6.4; missing yices
-or a skipped comparison with Halmos's real model parser fails CI.
+The test jobs install Halmos 0.3.3, z3 4.12.6 and yices 2.6.4, with every
+package Halmos needs at the versions in `eval/requirements-halmos.txt`, as the
+evaluation does. Missing yices or a skipped comparison with Halmos's real
+model parser fails CI.
 
 CI also runs the evaluation runner's regression tests and checks its Python
 and shell syntax. The runner's tests need Linux and Python 3.11 or later, with

@@ -48,6 +48,7 @@ a child subreaper.
 | `proc.py` | Commands under deadlines, with everything they start stopped |
 | `config.toml` | The settings, with what each budget covers |
 | `setup_vm.sh` | Installs every tool at its frozen version on a fresh VM |
+| `gambit-Cargo.lock`, `requirements-halmos.txt` | The versions of Gambit's and Halmos's dependencies, which their releases leave open |
 | `merge.py` | Merges the shards of one evaluation |
 | `test_runner.py` | Regression tests for the runner, without Foundry or solvers |
 | `smoke.toml`, `smoke_check.py`, `smoke/` | The smoke test, its project, and the check of its results |
