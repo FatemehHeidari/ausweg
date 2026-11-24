@@ -244,6 +244,19 @@ def tree_hash(project):
     return h.hexdigest()
 
 
+def svm_dir():
+    """The directory where forge keeps the solc versions it installs. Its
+    installer, svm, uses ~/.svm if that exists, else ~/.local/share/svm if
+    ~/.local/share exists, else ~/.svm. forge runs with the runner's scrubbed
+    environment, which has no XDG_DATA_HOME, so ~/.local/share is its data
+    directory."""
+    home = os.path.expanduser("~/.svm")
+    data = os.path.expanduser("~/.local/share")
+    if not os.path.exists(home) and os.path.exists(data):
+        return os.path.join(data, "svm")
+    return home
+
+
 def solc_for(project, forge, run_cmd):
     """The solc binary forge uses for the project, its version and its
     remappings, asked of forge through run_cmd(argv, cwd, tag, label). That
@@ -269,8 +282,8 @@ def solc_for(project, forge, run_cmd):
     if version and os.path.sep in str(version):
         path = version
     elif version:
-        cand = os.path.expanduser(f"~/.svm/{version}/solc-{version}")
+        cand = os.path.join(svm_dir(), version, f"solc-{version}")
         path = cand if os.path.exists(cand) else None
     if path is None:
-        return {"error": f"forge's solc {version} is not installed"}
+        return {"error": f"forge's solc {version} is not installed in {svm_dir()}"}
     return {"path": path, "version": version, "remappings": answers["remappings"].split()}

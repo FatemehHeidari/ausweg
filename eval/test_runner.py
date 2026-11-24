@@ -249,6 +249,40 @@ class ForgeQueriesAreBounded(Tmp):
                                  "remappings": ["a/=lib/a/", "b/=lib/b/"]})
 
 
+class SolcIsWhereForgeInstallsIt(Tmp):
+    """On a machine with ~/.local/share and no ~/.svm, forge installs solc in
+    ~/.local/share/svm. The runner looked only in ~/.svm, so there it skipped
+    every target's mutants."""
+
+    def solc_for(self, *dirs):
+        home = self.p("home")
+        for d in dirs:
+            os.makedirs(os.path.join(home, d), exist_ok=True)
+        forge = self.p("forge")
+        write(forge, "#!/bin/sh\n[ \"$1\" = config ] && echo '{\"solc\": \"0.8.38\"}'\nexit 0\n", 0o755)
+
+        def run_cmd(argv, cwd, tag, label):
+            return proc.run(argv, cwd, dict(os.environ), time.monotonic() + 30,
+                            self.p(tag + ".out"), self.p(tag + ".err"))
+        with mock.patch.dict(os.environ, {"HOME": home}):
+            return mutate.solc_for(self.tmp, forge, run_cmd)
+
+    def test_without_a_home_svm_it_is_under_local_share(self):
+        solc = os.path.join(".local", "share", "svm", "0.8.38", "solc-0.8.38")
+        write(self.p("home", solc), "")
+        self.assertEqual(self.solc_for().get("path"), self.p("home", solc))
+
+    def test_an_existing_home_svm_comes_first(self):
+        solc = os.path.join(".svm", "0.8.38", "solc-0.8.38")
+        write(self.p("home", solc), "")
+        self.assertEqual(self.solc_for(os.path.join(".local", "share")).get("path"), self.p("home", solc))
+
+    def test_a_missing_solc_names_where_it_was_looked_for(self):
+        found = self.solc_for(os.path.join(".local", "share"))
+        self.assertEqual(found, {"error": "forge's solc 0.8.38 is not installed in "
+                                          + self.p("home", ".local", "share", "svm")})
+
+
 class TheWrapperPinsTheBranchTimeout(Tmp):
     """Every Halmos process gets the runner's branch timeout, and each
     check's record keeps Halmos's path count."""
