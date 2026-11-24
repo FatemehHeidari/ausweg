@@ -381,7 +381,9 @@ def confirm(run, project, target_path, contract, abi, checks, budget, logdir, ta
     out = {}
     wanted = [c for c in checks if c in replay.PROPERTIES]
     for c in checks:
-        if c not in replay.PROPERTIES:
+        if replay.erc7540_exit(c):
+            out[c] = {"confirmed": False, "why": replay.NO_ERC7540_REPLAY}
+        elif c not in replay.PROPERTIES:
             out[c] = {"confirmed": False, "why": "not an exit property: the replay checks exit properties only"}
     if not wanted:
         return out

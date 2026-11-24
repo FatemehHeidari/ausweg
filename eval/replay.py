@@ -29,6 +29,15 @@ PROPERTIES = {
     "check_exit_max_redeem": ("invariant_exit_max_redeem", "exitMaxRedeem"),
     "check_exit_withdraw": ("invariant_exit_withdraw", "exitWithdraw"),
 }
+# ausweg's ERC-7540 exit checks: the steps of an exit, and that no one else
+# shrinks a request or lowers the share price. They have no replay yet.
+ERC7540_EXITS = ("check_request", "check_fulfil", "check_mature", "check_claim_redeem", "check_claim_withdraw")
+ERC7540_OTHERS = ("check_stable_", "check_fair_")
+NO_ERC7540_REPLAY = "No ERC-7540 replay implemented; counterexample remains unconfirmed."
+
+
+def erc7540_exit(check):
+    return check in ERC7540_EXITS or check.startswith(ERC7540_OTHERS)
 
 
 def ctor_args(abi):

@@ -105,6 +105,21 @@ class ReplayTimeIsReplayWorkOnly(Tmp):
         self.assertFalse(ran)
 
 
+class Erc7540CounterexamplesSayTheyHaveNoReplay(unittest.TestCase):
+    """A counterexample to an ERC-7540 exit check was reported as "not an exit
+    property". It is one; it stays unconfirmed because the runner has no
+    ERC-7540 replay."""
+
+    def test_the_reason_names_the_missing_replay(self):
+        exits = ["check_request", "check_fulfil", "check_mature", "check_claim_redeem", "check_claim_withdraw",
+                 "check_stable_redeem", "check_fair_deposit"]
+        out = runner.confirm(None, None, None, None, None, exits + ["check_keeps_deposit"], None, None, "target")
+        for c in exits:
+            self.assertEqual(out[c], {"confirmed": False,
+                                      "why": "No ERC-7540 replay implemented; counterexample remains unconfirmed."})
+        self.assertIn("not an exit property", out["check_keeps_deposit"]["why"])
+
+
 class FailedRunsAreNotSurvivors(unittest.TestCase):
     """A mutant run that ended with an error and no report was labelled
     survived."""

@@ -2,7 +2,8 @@
 
 Runs ausweg on a list of targets with the frozen settings in `config.toml`,
 replays each exit counterexample from deployment, runs Gambit's mutants, and
-classifies every result. Step 21 lists the settings; Step 22 describes the
+classifies every result. ERC-7540 targets have no replay yet, so a
+counterexample on one stays unconfirmed. Step 21 lists the settings; Step 22 describes the
 runner and its smoke test.
 
 ## On a fresh VM
