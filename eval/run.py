@@ -263,6 +263,8 @@ def prove(run, work, target, window, logdir, tag, mutant=False, only=None, hooks
         "EVAL_CHECK_RECORD": record,
         "EVAL_LOG_DIR": os.path.join(logdir, f"{tag}.halmos"),
     }
+    if limits.get("branch_query_ms") is not None:
+        extra["EVAL_BRANCH_TIMEOUT"] = f"{limits['branch_query_ms']}ms"
     if only:
         extra["EVAL_ONLY_CHECKS"] = ",".join(only)
     if mutant:

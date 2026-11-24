@@ -61,3 +61,32 @@ contract = "src/LoopVault.sol"
 label = "incomplete: Halmos's loop bound cuts paths of ping"
 expect = { checks = { check_keeps_ping = "incomplete" } }
 test_hooks = { only_checks = ["check_keeps_ping"] }
+
+# keeps withdraw on SolmateVaultBug proved in about 53 s in three runs and hit
+# its 600 s cap in a fourth. It runs three more times here, alone, so a smoke
+# run records how its outcome, time and path count vary on the machine. Either
+# outcome is allowed: one out of time contradicts no proof.
+
+[[target]]
+id = "repeat-1"
+project = "/tmp/eval-smoke/project"
+contract = "src/SolmateVaultBug.sol"
+label = "variation: keeps withdraw alone, run 1 of 3"
+expect = { repeat = "check_keeps_withdraw" }
+test_hooks = { only_checks = ["check_keeps_withdraw"] }
+
+[[target]]
+id = "repeat-2"
+project = "/tmp/eval-smoke/project"
+contract = "src/SolmateVaultBug.sol"
+label = "variation: keeps withdraw alone, run 2 of 3"
+expect = { repeat = "check_keeps_withdraw" }
+test_hooks = { only_checks = ["check_keeps_withdraw"] }
+
+[[target]]
+id = "repeat-3"
+project = "/tmp/eval-smoke/project"
+contract = "src/SolmateVaultBug.sol"
+label = "variation: keeps withdraw alone, run 3 of 3"
+expect = { repeat = "check_keeps_withdraw" }
+test_hooks = { only_checks = ["check_keeps_withdraw"] }

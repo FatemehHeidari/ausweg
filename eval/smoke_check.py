@@ -22,6 +22,19 @@ def through_link(project, rel):
     return any(os.path.islink(os.path.join(project, *parts[:i])) for i in range(1, len(parts) + 1))
 
 
+def check_run(r, name):
+    """The wrapper's record of check `name` in a target's result, or None."""
+    recs = [c for c in (r.get("prove") or {}).get("wrapper_checks") or [] if c.get("check") == name]
+    return recs[0] if recs else None
+
+
+def described(r, name):
+    rec = check_run(r, name) or {}
+    paths = rec.get("num_paths")
+    return (f"{(r.get('checks') or {}).get(name)}, {rec.get('seconds')} s, "
+            f"{paths[0] if paths else 'no'} paths")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--targets", required=True)
@@ -71,6 +84,10 @@ def main():
                   bool(linked) and r.get("original_unchanged") is True,
                   f"{len(linked)} of the {len(ran)} mutants run are in a linked directory"
                   + (f", such as {linked[0]['file']}" if linked else ""))
+        if e.get("repeat"):
+            got = (r.get("checks") or {}).get(e["repeat"])
+            check(t["id"], f"{e['repeat']} is proved or stopped at a limit, as it may be",
+                  got in ("proved", "unfinished", "timeout"), described(r, e["repeat"]))
         if e.get("wrapper_stopped_processes"):
             wc = r["prove"]["wrapper_checks"]
             stopped = [p for c in wc for p in c.get("left_running_and_stopped", [])]
@@ -108,12 +125,31 @@ def main():
     check("run", "forge's queries for Gambit ran under the mutation budget, and were recorded",
           len(queries) >= 2 and all(x["status"] == "exited" and x["returncode"] == 0 for x in queries),
           ", ".join(f"{x['label']} {x['seconds']} s" for x in queries) or "none recorded")
+    flag = ["--solver-timeout-branching", f"{man['config']['limits'].get('branch_query_ms')}ms"]
+    halmos = []
+    for dirpath, _, fnames in os.walk(a.out):
+        for f in fnames:
+            if f.endswith(".checks.jsonl"):
+                halmos += [json.loads(x)["cmd"] for x in files.read_lines(os.path.join(dirpath, f))]
+    pinned = [c for c in halmos if any(c[i:i + 2] == flag for i in range(len(c) - 1))]
+    check("run", "every Halmos process ran with the configured branch timeout",
+          halmos and len(pinned) == len(halmos), f"{len(pinned)} of {len(halmos)} with {' '.join(flag)}")
     seeds = [x for x in cmds if "--fuzz-seed" in x["cmd"]]
     check("run", "every fuzz campaign saved with its seed", bool(seeds),
           f"{len(seeds)} campaigns with --fuzz-seed")
     width = max(len(x[1]) for x in lines)
     for tid, what, res, evidence in lines:
         print(f"{res:4}  {tid:18} {what:{width}}  {evidence}")
+    # Every run of each repeated check, the repeats and any other target's.
+    for name, contract in dict.fromkeys((t["expect"]["repeat"], t["contract"]) for t in targets
+                                        if t.get("expect", {}).get("repeat")):
+        print(f"\n{name} on {contract}, every run:")
+        for t in targets:
+            path = os.path.join(a.out, t["id"], "result.json")
+            if t["contract"] == contract and os.path.exists(path):
+                r = files.read_json(path)
+                if check_run(r, name):
+                    print(f"  {t['id']:18} {described(r, name)}")
     sys.exit(0 if ok_all else 1)
 
 

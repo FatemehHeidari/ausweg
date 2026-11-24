@@ -11,8 +11,11 @@ would read Halmos's own.
 
 Set by the runner: EVAL_REAL_HALMOS, EVAL_CHECK_CAP (seconds),
 EVAL_TARGET_DEADLINE (Unix time), EVAL_CHECK_RECORD (JSON lines),
-EVAL_LOG_DIR. EVAL_ONLY_CHECKS (comma-separated names) runs a subset, for the
-runner's own tests.
+EVAL_LOG_DIR, and EVAL_BRANCH_TIMEOUT, given to every Halmos process as
+--solver-timeout-branching. EVAL_ONLY_CHECKS (comma-separated names) runs a
+subset, for the runner's own tests.
+
+Each check's record keeps its outcome, its time and Halmos's path count.
 """
 
 import json
@@ -73,6 +76,10 @@ def main():
     record = os.environ.get("EVAL_CHECK_RECORD")
     log_dir = os.environ.get("EVAL_LOG_DIR", ".")
     only = [c for c in os.environ.get("EVAL_ONLY_CHECKS", "").split(",") if c]
+    branch = os.environ.get("EVAL_BRANCH_TIMEOUT")
+    if branch and "--solver-timeout-branching" in args:
+        sys.exit("ausweg already passes --solver-timeout-branching: the runner's must be the only one")
+    pinned = ["--solver-timeout-branching", branch] if branch else []
     os.makedirs(log_dir, exist_ok=True)
     proc.become_subreaper()
 
@@ -90,7 +97,7 @@ def main():
                   + [c for c in checks if not c.startswith("check_exit_")])
     if not checks:
         # Nothing to split: run Halmos as ausweg asked.
-        os.execv(real, [real] + args)
+        os.execv(real, [real] + args + pinned)
 
     base = list(args)
     i = base.index("--json-output")
@@ -101,7 +108,7 @@ def main():
         jk = os.path.join(log_dir, f"{contract}.{name}.json")
         if os.path.exists(jk):
             os.remove(jk)
-        cmd = [real] + base + ["--match-test", f"^{name}\\(", "--json-output", jk]
+        cmd = [real] + base + pinned + ["--match-test", f"^{name}\\(", "--json-output", jk]
         limit = min(cap, target_deadline - time.time())
         started = time.time()
         rec = {"check": name, "cmd": cmd, "start": started, "limit_seconds": round(max(limit, 0), 3)}
@@ -159,6 +166,8 @@ def main():
             entries.extend(got)
             rec["outcome"] = "completed"
             rec["halmos_exitcodes"] = [e.get("exitcode") for e in got]
+            # Halmos's count: [paths explored, those ending without an error, those stuck].
+            rec["num_paths"] = got[0].get("num_paths") if got else None
         if record:
             with open(record, "a") as f:
                 f.write(json.dumps(rec) + "\n")

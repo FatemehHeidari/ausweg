@@ -15,8 +15,7 @@ sh setup_vm.sh <commit>
 cd /opt/ausweg-eval/src/ausweg
 python3 -I eval/test_runner.py
 sh eval/smoke/make_project.sh /tmp/eval-smoke/project
-python3 -I eval/run.py --config eval/config.toml --targets eval/smoke.toml --out /tmp/eval-smoke/run
-python3 -I eval/smoke_check.py --targets eval/smoke.toml --out /tmp/eval-smoke/run
+python3 -I eval/run.py --config eval/config.toml --targets eval/smoke.toml --out /tmp/eval-smoke/run && python3 -I eval/smoke_check.py --targets eval/smoke.toml --out /tmp/eval-smoke/run
 ```
 
 ## Running the evaluation in shards

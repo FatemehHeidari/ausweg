@@ -249,6 +249,46 @@ class ForgeQueriesAreBounded(Tmp):
                                  "remappings": ["a/=lib/a/", "b/=lib/b/"]})
 
 
+class TheWrapperPinsTheBranchTimeout(Tmp):
+    """Every Halmos process gets the runner's branch timeout, and each
+    check's record keeps Halmos's path count."""
+
+    def wrapper(self, *extra):
+        write(self.p("work", "test", "generated", "V.proof.t.sol"),
+              "contract VProof {\n  function check_a() public {}\n}\n")
+        write(self.p("halmos"), textwrap.dedent(f"""\
+            #!{sys.executable}
+            import json, sys
+            a = sys.argv[1:]
+            with open({self.p("argv")!r}, "a") as f:
+                f.write(json.dumps(a) + "\\n")
+            result = {{"name": "check_a()", "exitcode": 0, "num_models": 0, "models": [],
+                       "num_paths": [7, 7, 0], "time": [0.1, 0.1, 0], "num_bounded_loops": 0}}
+            with open(a[a.index("--json-output") + 1], "w") as f:
+                json.dump({{"exitcode": 0, "test_results": {{"test/generated/V.proof.t.sol:VProof": [result]}}}}, f)
+            """), 0o755)
+        env = dict(os.environ, EVAL_REAL_HALMOS=self.p("halmos"), EVAL_CHECK_RECORD=self.p("checks.jsonl"),
+                   EVAL_LOG_DIR=self.p("logs"), EVAL_BRANCH_TIMEOUT="1ms")
+        return subprocess.run([sys.executable, "-I", halmos_per_check.__file__, "--root", self.p("work"),
+                               "--contract", "VProof", "--json-output", self.p("merged.json"), *extra],
+                              cwd=self.p("work"), env=env, capture_output=True, text=True, timeout=60)
+
+    def test_each_check_runs_with_the_branch_timeout_and_keeps_its_path_count(self):
+        r = self.wrapper()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        argv = [json.loads(x) for x in files.read_lines(self.p("argv"))]
+        self.assertEqual(len(argv), 1)
+        i = argv[0].index("--solver-timeout-branching")
+        self.assertEqual(argv[0][i + 1], "1ms")
+        rec = json.loads(files.read_lines(self.p("checks.jsonl"))[0])
+        self.assertEqual((rec["outcome"], rec["num_paths"]), ("completed", [7, 7, 0]))
+
+    def test_a_second_branch_timeout_is_refused(self):
+        r = self.wrapper("--solver-timeout-branching", "5ms")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertFalse(os.path.exists(self.p("argv")), "Halmos never ran")
+
+
 class TheRunnerReadsWhatToolsWrote(Tmp):
     """The files ausweg and forge write, read where the runner reads them."""
 

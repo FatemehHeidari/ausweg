@@ -39,7 +39,17 @@ commit = "072ff4c6d747397f859e0a15a20fe1ff05672332"
 
 # Time limits, in seconds. Every step belongs to one budget, and none runs
 # past it:
-# - query_seconds: one solver query (`ausweg prove --solver-timeout`).
+# - query_seconds: one solver query (`ausweg prove --solver-timeout`). For
+#   ausweg it is a budget that its solver calls and rewrite checks share, each
+#   stopped by its own limit, so a query can run slightly over; Halmos stops
+#   it outright 5 s later. A Halmos baseline's query is stopped by Halmos at
+#   query_seconds. The two are close, but not the same hard limit.
+# - branch_query_ms: Halmos's limit on one branch condition, in milliseconds,
+#   passed to every Halmos process; 1 is Halmos 0.3.3's default. Halmos
+#   answers branch conditions with its own z3, for ausweg and a Halmos
+#   baseline alike. A condition not answered in time is explored both ways:
+#   proofs stay sound, but the paths explored, and so the time a check takes,
+#   vary with the machine's load.
 # - check_seconds: one Halmos check; one stopped there is "unfinished",
 #   which is not a solver timeout.
 # - target_seconds, by the clock: copying and building the target, and
@@ -54,6 +64,7 @@ commit = "072ff4c6d747397f859e0a15a20fe1ff05672332"
 # replay_seconds, 7,800 s, plus the runner's bookkeeping between steps.
 [limits]
 query_seconds = 60
+branch_query_ms = 1
 check_seconds = 600
 target_seconds = 3600
 mutation_seconds = 3600
