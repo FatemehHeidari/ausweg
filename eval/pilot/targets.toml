@@ -1,0 +1,46 @@
+# Pilot 1 (Step 24): five targets drawn from the Step 19 manifest before any
+# was run. The population is the manifest's 61 targets: its Vault rows, in
+# its order, but Tare, whose contest is still pending (population.tsv).
+# draw.py shuffles them with Python's random.Random(0) and takes the first
+# five; they are five different contests. prepare.py fetches each project
+# into /tmp/eval-pilot/projects as its contest repo pins it. Mutation is off.
+
+[[target]]
+id = "napier-rsethadapter"
+project = "/tmp/eval-pilot/projects/2024-05-napier-update/napier-uups-adapters"
+contract = "src/adapters/kelp/RsETHAdapter.sol"
+label = "2024-05-napier-update: RsETHAdapter (manifest row 18)"
+mutate = false
+source = { repo = "sherlock-audit/2024-05-napier-update", commit = "37ec1d72a22e8a37b2168a6c35ed06abfe343326", project = "napier-uups-adapters" }
+
+[[target]]
+id = "loopfi-stakinglpeth"
+project = "/tmp/eval-pilot/projects/2024-10-loopfi"
+contract = "src/StakingLPEth.sol"
+label = "2024-10-loopfi: StakingLPEth (manifest row 46)"
+mutate = false
+source = { repo = "code-423n4/2024-10-loopfi", commit = "d219f0132005b00a68f505edc22b34f9a8b49766", project = "." }
+
+[[target]]
+id = "sentiment-superpool"
+project = "/tmp/eval-pilot/projects/2024-08-sentiment-v2/protocol-v2"
+contract = "src/SuperPool.sol"
+label = "2024-08-sentiment-v2: SuperPool (manifest row 39)"
+mutate = false
+source = { repo = "sherlock-audit/2024-08-sentiment-v2", commit = "3e7b69b1d7653714ee26e50ffbcfb8f8a96ed7cd", project = "protocol-v2" }
+
+[[target]]
+id = "concrete-protectstrategy"
+project = "/tmp/eval-pilot/projects/2024-11-concrete"
+contract = "src/strategies/ProtectStrategy/ProtectStrategy.sol"
+label = "2024-11-concrete: ProtectStrategy (manifest row 49)"
+mutate = false
+source = { repo = "code-423n4/2024-11-concrete", commit = "d2950ec68fdc391c10989d98748e79d1a0017f69", project = "." }
+
+[[target]]
+id = "peapods-autocompoundingpodlp"
+project = "/tmp/eval-pilot/projects/2025-01-peapods-finance/contracts"
+contract = "contracts/AutoCompoundingPodLp.sol"
+label = "2025-01-peapods-finance: AutoCompoundingPodLp (manifest row 59)"
+mutate = false
+source = { repo = "sherlock-audit/2025-01-peapods-finance", commit = "d49944b55cdae7bfdf0c734614a608c892a03604", project = "contracts" }

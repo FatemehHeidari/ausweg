@@ -70,6 +70,7 @@ a child subreaper.
 | `merge.py` | Merges the shards of one evaluation, and lists every disagreement with a solver baseline |
 | `test_runner.py` | Regression tests for the runner, without Foundry or solvers |
 | `smoke.toml`, `smoke_check.py`, `smoke/` | The smoke test, its project, and the check of its results |
+| `pilot/` | Pilot 1 (Step 24): five targets drawn from the manifest, how their projects are fetched, and the pilot's settings |
 
 Each run directory holds `manifests/` (settings, tool paths, versions and
 hashes, runner commit, host, the environment commands get), `events.jsonl`

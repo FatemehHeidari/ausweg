@@ -1,0 +1,140 @@
+# Pilot 1 (Step 24): eval/config.toml's frozen settings, line for line,
+# with two changes: [runner] says this is the pilot, and there are no
+# solver baselines. Mutation is off in eval/pilot/targets.toml. Not the
+# evaluation.
+
+[runner]
+pilot = "Pilot 1 (Step 24): five contest vaults, ausweg and its replay only"
+machine = "one Linux VM per shard, all of one type: 2 dedicated vCPUs, one run at a time"
+allow_version_mismatch = false
+
+# Each tool's path, under the prefix eval/setup_vm.sh installs into, and the
+# version it must report. The runner reaches each tool through a logging shim
+# in <out>/bin, records every executable a command ran, and keeps only HOME,
+# USER, LOGNAME, LANG, LC_ALL, TMPDIR and TERM from its own environment.
+[tools.ausweg]
+bin = "/opt/ausweg-eval/bin/ausweg"
+version = "ausweg 0.8.1"
+source = "built by eval/setup_vm.sh from the commit that holds this runner"
+
+[tools.halmos]
+bin = "/opt/ausweg-eval/venv/bin/halmos"
+version = "halmos 0.3.3"
+
+[tools.z3]
+bin = "/opt/ausweg-eval/venv/bin/z3"
+version = "Z3 version 4.12.6"
+
+[tools.yices]
+bin = "/opt/ausweg-eval/venv/bin/yices-smt2"
+version = "Yices 2.6.4"
+
+[tools.forge]
+bin = "/opt/ausweg-eval/foundry/bin/forge"
+version = "forge Version: 1.9.0"
+commit = "6056c5845d34205a83cf7108042adb137325c9df"
+
+[tools.gambit]
+bin = "/opt/ausweg-eval/bin/gambit"
+tag = "v1.0.7"
+commit = "072ff4c6d747397f859e0a15a20fe1ff05672332"
+
+# The solver baselines' bitwuzla and cvc5: the binaries Halmos 0.3.3
+# downloads for `--solver bitwuzla` and `--solver cvc5`, from the release
+# archives it pins (eval/setup_vm.sh checks them against Halmos's sha256).
+# The runner refuses any other binary.
+[tools.bitwuzla]
+bin = "/opt/ausweg-eval/solvers/bitwuzla"
+version = "0.8.1"
+sha256 = "3e362ec7994925ad1590f1fb75d76828ae470035e369fcd7cde1ebd8d049b03e"
+
+[tools.cvc5]
+bin = "/opt/ausweg-eval/solvers/cvc5"
+version = "This is cvc5 version 1.2.1"
+sha256 = "ee4c6787a95218a571080a599bdf579aca5b0f1e4f27687f70f46d4d12148974"
+
+# Time limits, in seconds. Every step belongs to one budget, and none runs
+# past it:
+# - query_seconds: one solver query (`ausweg prove --solver-timeout`). For
+#   ausweg it is a budget that its solver calls and rewrite checks share, each
+#   stopped by its own limit, so a query can run slightly over; Halmos stops
+#   it outright 5 s later. A Halmos baseline's query is stopped by Halmos at
+#   query_seconds. The two are close, but not the same hard limit.
+# - branch_query_ms: Halmos's limit on one branch condition, in milliseconds,
+#   passed to every Halmos process; 1 is Halmos 0.3.3's default. Halmos
+#   answers branch conditions with its own z3, for ausweg and a Halmos
+#   baseline alike. A condition not answered in time is explored both ways:
+#   proofs stay sound, but the paths explored, and so the time a check takes,
+#   vary with the machine's load.
+# - check_seconds: one Halmos check; one stopped there is "unfinished",
+#   which is not a solver timeout.
+# - target_seconds, by the clock: copying and building the target, and
+#   ausweg's run on it as audited, its report included. A check not started
+#   when it is spent is unfinished too.
+# - solver_seconds, by the clock, for each solver baseline: every check of
+#   ausweg's proof of the target, run again with that solver. A check not
+#   started when it is spent is unfinished.
+# - mutation_seconds, by the clock: choosing the functions, Gambit, and every
+#   mutant's copy, build and run, in the sampled order. Before each mutant
+#   starts, it gets an equal share: the time left divided by the mutants
+#   left, so time one does not use goes to the rest. Its copy, build and run
+#   come out of its share. A mutant whose share is too short to start is
+#   "not run", one stopped at its share's end is inconclusive, and both
+#   count as not killed. The clock waits while a kill is replayed, which is
+#   charged to replay_seconds.
+# - replay_seconds, by the work done: every replay search and replay for one
+#   target and its mutants. Each is charged what it took; nothing else is.
+# So a target takes at most target_seconds + 3 x solver_seconds +
+# mutation_seconds + replay_seconds, 18,600 s, plus the runner's bookkeeping
+# between steps.
+[limits]
+query_seconds = 60
+branch_query_ms = 1
+check_seconds = 600
+target_seconds = 3600
+solver_seconds = 3600
+mutation_seconds = 3600
+replay_seconds = 600
+
+[prove]
+loop = 2
+bound_amounts = false
+price = true
+check_rewrite = "sample"
+check_every = 16
+check_seed = 0
+check_timeout = 10
+# On a mutant, as ausweg's own mutant runs: its checks only cost time, and
+# a kill needs a replay anyway.
+mutant_check_rewrite = "off"
+
+# No solver baselines in the pilot.
+[baselines]
+solvers = []
+
+# Gambit: every operator, at most max_mutants per target, sampled with seed
+# from the pool ordered by file and Gambit's id. The functions mutated are
+# those an exit calls (eval/mutate.py says how they are found).
+[mutation]
+max_mutants = 100
+seed = 0
+operators = [
+    "assignment-mutation",
+    "binary-op-mutation",
+    "delete-expression-mutation",
+    "elim-delegate-mutation",
+    "function-call-mutation",
+    "if-statement-mutation",
+    "require-mutation",
+    "swap-arguments-function-mutation",
+    "swap-arguments-operator-mutation",
+    "unary-operator-mutation",
+]
+
+# Replay search: forge's invariant fuzzer, one campaign after another with
+# seeds first_seed, first_seed + 1, ..., until a failure or the budget's end.
+[replay]
+engine = "forge 1.9.0 invariant fuzzer, one worker"
+campaign_runs = 256
+campaign_depth = 64
+first_seed = 1
