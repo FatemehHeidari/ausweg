@@ -77,12 +77,20 @@ def main(argv=None):
         "targets": {tid: {"shard": where[tid], "class": r["class"], "checks": r.get("checks"),
                           "mutation": (r.get("mutation") or {}).get("counts"),
                           "kill_rate": (r.get("mutation") or {}).get("kill_rate"),
+                          "baselines": run.baseline_summary(r),
                           "original_unchanged": r.get("original_unchanged"),
                           "project_sha256": r.get("project_sha256"), "seconds": r.get("seconds")}
                     for tid, r in results.items()},
+        # Every check a solver baseline and `ausweg smt` decided differently,
+        # to examine before the results are reported.
+        "disagreements": [{"target": tid, **d} for tid, r in results.items()
+                          for d in (r.get("baselines") or {}).get("disagreements", [])],
     }
     files.write_json(os.path.join(a.out, "summary.json"), summary)
     print(f"merged {len(results)} targets from {len(a.shards)} shards")
+    if summary["disagreements"]:
+        print(f"{len(summary['disagreements'])} disagreements between ausweg smt and a solver baseline: "
+              "see summary.json")
 
 
 if __name__ == "__main__":

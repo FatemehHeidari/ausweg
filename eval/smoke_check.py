@@ -35,12 +35,118 @@ def described(r, name):
             f"{paths[0] if paths else 'no'} paths")
 
 
+BASELINE_CLASSES = ("proved", "counterexample", "timeout", "incomplete", "vacuous", "unfinished", "error")
+
+
+def limits_of(t, man):
+    """A target's limits: the frozen ones, with its test hooks' own."""
+    return dict(man["config"]["limits"], **t.get("test_hooks", {}).get("limits", {}))
+
+
+def ran_baselines(r):
+    """The solver baselines that ran on a target, by solver."""
+    return {n: s for n, s in ((r.get("baselines") or {}).get("solvers") or {}).items() if "not_run" not in s}
+
+
+def check_baselines(t, r, e, man, check):
+    """What a target's solver baselines must show."""
+    tid, ran = t["id"], ran_baselines(r)
+    if "baselines" in e:
+        want = e["baselines"]
+        picked = t.get("test_hooks", {}).get("baseline_checks")
+        asked = sorted(c for c in (r.get("checks") or {}) if picked is None or c in picked)
+        ok = sorted(ran) == sorted(want) and all(
+            sorted(s["checks"]) == asked and set(s["checks"].values()) <= set(BASELINE_CLASSES) for s in ran.values())
+        check(tid, f"solver baselines {', '.join(want)} ran on every check", ok,
+              "; ".join(f"{n}: {s['counts']}, {s['run']['seconds']} s" for n, s in ran.items()) or "none ran")
+        table = (man["tools"].get("halmos") or {}).get("solvers") or {}
+        bad = [n for n, s in ran.items() if (table.get(n) or {}).get("arguments") != s["arguments"]
+               or (table.get(n) or {}).get("binary") != os.path.basename(s["binary"]["path"])]
+        check(tid, "each solver ran as Halmos's --solver would: its binary, with Halmos's arguments",
+              ran and not bad,
+              "; ".join(f"{n}: {os.path.basename(s['binary']['path'])} {' '.join(s['arguments'])}"
+                        for n, s in ran.items()) + (f"; not as Halmos: {bad}" if bad else ""))
+        dis = (r.get("baselines") or {}).get("disagreements") or []
+        check(tid, "no check that ausweg smt and a solver decided differently", ran and not dis, dis or "none")
+    if ran:
+        budget = limits_of(t, man)["solver_seconds"]
+        over = {n: s["run"]["seconds"] for n, s in ran.items() if s["run"]["seconds"] > budget + 5}
+        still = [p for s in ran.values() for p in s["run"]["still_running_after_stop"]
+                 + [q for c in s["wrapper_checks"] for q in c.get("still_running_after_stop", [])]]
+        check(tid, "each solver baseline kept its budget and left no process running", not over and not still,
+              f"budget {budget} s; " + ", ".join(f"{n} {s['run']['seconds']} s" for n, s in ran.items())
+              + (f"; over: {over}" if over else "") + (f"; still running {still}" if still else ""))
+    if e.get("baseline_queries"):
+        runs = {n: s.get("solver_runs") or {} for n, s in ran.items()}
+        check(tid, "each solver answered Halmos's queries, the solver itself and not Halmos alone",
+              ran and all(sum(v.values()) for v in runs.values()),
+              "; ".join(f"{n}: " + ", ".join(f"{c} {k}" for c, k in v.items()) for n, v in runs.items()))
+    for n, want in e.get("baseline_checks", {}).items():
+        for c, cls in want.items():
+            got = (ran.get(n) or {}).get("checks", {}).get(c)
+            rec = next((x for x in (ran.get(n) or {}).get("wrapper_checks", []) if x["check"] == c), {})
+            check(tid, f"{n}: {c} is {cls}", got == cls,
+                  f"{got}, {rec.get('seconds')} s, {((ran.get(n) or {}).get('solver_runs') or {}).get(c)} solver runs")
+    if e.get("baseline_stopped_processes"):
+        wc = [c for s in ran.values() for c in s["wrapper_checks"]]
+        stopped = [p for c in wc for p in c.get("left_running_and_stopped", [])]
+        still = [p for c in wc for p in c.get("still_running_after_stop", [])]
+        check(tid, "the baseline check's processes were stopped, and none survived", bool(stopped) and not still,
+              f"stopped {stopped}; still running {still}")
+
+
+def same_arguments(targets, out, man):
+    """Whether every solver baseline ran ausweg's Halmos arguments with only
+    the solver command and the query limit changed, the latter to the
+    target's own. Returns (ok, evidence)."""
+    runs, bad = 0, []
+    for t in targets:
+        path = os.path.join(out, t["id"], "result.json")
+        if not os.path.exists(path):
+            continue
+        r = files.read_json(path)
+        ausweg = (r.get("baselines") or {}).get("halmos_args") or []
+        for n, s in ran_baselines(r).items():
+            runs += 1
+            mine = s["argv"][1:-2]
+            at = {ausweg.index(f) + 1: v for f, v in (("--solver-command", s["solver_command"]),
+                                                       ("--solver-timeout-assertion",
+                                                        f"{limits_of(t, man)['query_seconds']}s"))
+                  if f in ausweg}
+            if len(at) != 2 or len(mine) != len(ausweg) or any(
+                    mine[i] != at.get(i, ausweg[i]) for i in range(len(ausweg))):
+                bad.append(f"{t['id']} {n}")
+    return runs and not bad, f"{runs} runs" + (f"; changed otherwise: {bad}" if bad else "")
+
+
+def baseline_rows(targets, out):
+    """Each check a solver baseline ran: its class and time by ausweg smt and
+    by each solver."""
+    rows = []
+    for t in targets:
+        path = os.path.join(out, t["id"], "result.json")
+        if not os.path.exists(path):
+            continue
+        r = files.read_json(path)
+        ran = ran_baselines(r)
+        for c in dict.fromkeys(c for s in ran.values() for c in s["checks"]):
+            cells = [f"ausweg smt {(r.get('checks') or {}).get(c)} {(check_run(r, c) or {}).get('seconds')} s"]
+            for n, s in ran.items():
+                rec = next((x for x in s["wrapper_checks"] if x["check"] == c), {})
+                cells.append(f"{n} {s['checks'].get(c)} {rec.get('seconds')} s, "
+                             f"{(s.get('solver_runs') or {}).get(c)} runs")
+            rows.append((t["id"], c, " | ".join(cells)))
+    return rows
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--targets", required=True)
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
     targets = files.read_toml(a.targets)["target"]
+    mdir = os.path.join(a.out, "manifests")
+    man = files.read_json(os.path.join(mdir, sorted(os.listdir(mdir))[-1]))
     lines, ok_all = [], True
 
     def check(tid, what, ok, evidence):
@@ -101,11 +207,12 @@ def main():
             check(t["id"], "ausweg, Halmos and the solvers were stopped, and none survived",
                   r["prove"]["status"] == "stopped at the deadline" and bool(names & set(SOLVERS)) and not still,
                   f"status {r['prove']['status']}; stopped {sorted(names)}; still running {still}")
+        check_baselines(t, r, e, man, check)
         check(t["id"], "the original project is unchanged", r.get("original_unchanged") is True,
               r.get("original_unchanged"))
     # The run's own records.
-    mdir = os.path.join(a.out, "manifests")
-    man = files.read_json(os.path.join(mdir, sorted(os.listdir(mdir))[-1]))
+    check("run", "every solver baseline ran ausweg's Halmos arguments, with only the solver and its query "
+          "limit changed", *same_arguments(targets, a.out, man))
     check("run", "tool versions match the frozen ones", not man["version_problems"],
           "; ".join(man["version_problems"]) or ", ".join(f"{k} {v.get('reported')}" for k, v in man["tools"].items()))
     ev = [json.loads(x) for x in files.read_lines(os.path.join(a.out, "events.jsonl"))]
@@ -150,6 +257,11 @@ def main():
                 r = files.read_json(path)
                 if check_run(r, name):
                     print(f"  {t['id']:18} {described(r, name)}")
+    rows = baseline_rows(targets, a.out)
+    if rows:
+        print("\nSolver baselines, every check they ran: class and time, by ausweg smt and by each solver:")
+        for tid, c, cells in rows:
+            print(f"  {tid:18} {c:28} {cells}")
     sys.exit(0 if ok_all else 1)
 
 

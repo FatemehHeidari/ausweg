@@ -3,6 +3,11 @@
 # Each target says what it must show; eval/smoke_check.py reads the results
 # against it. test_hooks change limits or run a subset of checks, for these
 # tests only.
+#
+# The solver baselines run every check of a target again with each of three
+# solvers, which on these vaults would take hours: most raw-solver queries on
+# mulDiv run to the 60 s limit. Here they run only where they show something,
+# with baseline_solvers and baseline_checks naming what runs.
 
 [[target]]
 id = "proved-and-gambit"
@@ -10,10 +15,11 @@ project = "/tmp/eval-smoke/project"
 contract = "src/SolmateVault.sol"
 label = "correct demo"
 mutate = true
-expect = { class = "proved", confirmed_kill = true, linked_dependency_mutated = true }
+expect = { class = "proved", confirmed_kill = true, linked_dependency_mutated = true, baselines = ["yices"] }
 # The smoke test needs one complete Gambit case: it stops at its first
-# confirmed kill instead of running every mutant.
-test_hooks = { stop_after_confirmed_kills = 1 }
+# confirmed kill instead of running every mutant. One baseline check runs
+# before the mutants, on the same copy of the project.
+test_hooks = { stop_after_confirmed_kills = 1, baseline_solvers = ["yices"], baseline_checks = ["check_init"] }
 
 [[target]]
 id = "known-bug"
@@ -21,22 +27,41 @@ project = "/tmp/eval-smoke/project"
 contract = "src/SolmateVaultBug.sol"
 label = "known bug: convertToAssets rounds up"
 expect = { class = "confirmed counterexample", confirmed = ["check_exit_withdraw"] }
+test_hooks = { baseline_solvers = [] }
+
+# Halmos decides init with no solver query, and each solver answers 14 for
+# keeps asset mint.
+[[target]]
+id = "solver-baselines"
+project = "/tmp/eval-smoke/project"
+contract = "src/SolmateVaultBug.sol"
+label = "solver baselines: yices, bitwuzla and cvc5-int on two checks"
+expect = { baselines = ["yices", "bitwuzla", "cvc5-int"], baseline_queries = true, baseline_checks = { yices = { check_init = "proved", check_keeps_asset_mint = "proved" }, bitwuzla = { check_init = "proved", check_keeps_asset_mint = "proved" }, cvc5-int = { check_init = "proved", check_keeps_asset_mint = "proved" } } }
+test_hooks = { only_checks = ["check_init", "check_keeps_asset_mint"] }
+
+[[target]]
+id = "solver-budget"
+project = "/tmp/eval-smoke/project"
+contract = "src/SolmateVaultBug.sol"
+label = "time limits: a 30-second budget for a solver baseline"
+expect = { baselines = ["yices"], baseline_checks = { yices = { check_keeps_transfer = "unfinished" } }, baseline_stopped_processes = true }
+test_hooks = { only_checks = ["check_keeps_transfer"], limits = { solver_seconds = 30 }, baseline_solvers = ["yices"] }
 
 [[target]]
 id = "solver-timeout"
 project = "/tmp/eval-smoke/project"
 contract = "src/OZVault.sol"
 label = "time limits: a five-second solver query limit on OpenZeppelin's 512-bit mulDiv"
-expect = { checks = { check_keeps_mint = "timeout" } }
-test_hooks = { only_checks = ["check_keeps_mint"], limits = { query_seconds = 5 } }
+expect = { checks = { check_keeps_mint = "timeout" }, baselines = ["yices"] }
+test_hooks = { only_checks = ["check_keeps_mint"], limits = { query_seconds = 5, solver_seconds = 60 }, baseline_solvers = ["yices"] }
 
 [[target]]
 id = "check-cap"
 project = "/tmp/eval-smoke/project"
 contract = "src/SolmateVault.sol"
 label = "time limits: a 15-second cap on one check"
-expect = { checks = { check_keeps_deposit = "unfinished" }, wrapper_stopped_processes = true }
-test_hooks = { only_checks = ["check_keeps_deposit"], limits = { check_seconds = 15 } }
+expect = { checks = { check_keeps_deposit = "unfinished" }, wrapper_stopped_processes = true, baselines = ["yices"], baseline_checks = { yices = { check_keeps_deposit = "unfinished" } }, baseline_stopped_processes = true }
+test_hooks = { only_checks = ["check_keeps_deposit"], limits = { check_seconds = 15 }, baseline_solvers = ["yices"] }
 
 [[target]]
 id = "target-budget"
@@ -44,7 +69,7 @@ project = "/tmp/eval-smoke/project"
 contract = "src/SolmateVault.sol"
 label = "time limits: a 25-second budget for the whole target"
 expect = { class = "unfinished" }
-test_hooks = { limits = { target_seconds = 25 } }
+test_hooks = { limits = { target_seconds = 25 }, baseline_solvers = [] }
 
 [[target]]
 id = "runner-stop"
@@ -52,14 +77,14 @@ project = "/tmp/eval-smoke/project"
 contract = "src/SolmateVault.sol"
 label = "time limits: the runner stops ausweg, Halmos and the solvers mid-check"
 expect = { class = "unfinished", runner_stopped_processes = true }
-test_hooks = { only_checks = ["check_keeps_deposit"], runner_seconds = 20 }
+test_hooks = { only_checks = ["check_keeps_deposit"], runner_seconds = 20, baseline_solvers = [] }
 
 [[target]]
 id = "loop-bound"
 project = "/tmp/eval-smoke/project"
 contract = "src/LoopVault.sol"
-label = "incomplete: Halmos's loop bound cuts paths of ping"
-expect = { checks = { check_keeps_ping = "incomplete" } }
+label = "incomplete: Halmos's loop bound cuts paths of ping, with ausweg smt and each solver"
+expect = { checks = { check_keeps_ping = "incomplete" }, baselines = ["yices", "bitwuzla", "cvc5-int"], baseline_checks = { yices = { check_keeps_ping = "incomplete" }, bitwuzla = { check_keeps_ping = "incomplete" }, cvc5-int = { check_keeps_ping = "incomplete" } } }
 test_hooks = { only_checks = ["check_keeps_ping"] }
 
 # keeps withdraw on SolmateVaultBug proved in about 53 s in three runs and hit
@@ -73,7 +98,7 @@ project = "/tmp/eval-smoke/project"
 contract = "src/SolmateVaultBug.sol"
 label = "variation: keeps withdraw alone, run 1 of 3"
 expect = { repeat = "check_keeps_withdraw" }
-test_hooks = { only_checks = ["check_keeps_withdraw"] }
+test_hooks = { only_checks = ["check_keeps_withdraw"], baseline_solvers = [] }
 
 [[target]]
 id = "repeat-2"
@@ -81,7 +106,7 @@ project = "/tmp/eval-smoke/project"
 contract = "src/SolmateVaultBug.sol"
 label = "variation: keeps withdraw alone, run 2 of 3"
 expect = { repeat = "check_keeps_withdraw" }
-test_hooks = { only_checks = ["check_keeps_withdraw"] }
+test_hooks = { only_checks = ["check_keeps_withdraw"], baseline_solvers = [] }
 
 [[target]]
 id = "repeat-3"
@@ -89,4 +114,4 @@ project = "/tmp/eval-smoke/project"
 contract = "src/SolmateVaultBug.sol"
 label = "variation: keeps withdraw alone, run 3 of 3"
 expect = { repeat = "check_keeps_withdraw" }
-test_hooks = { only_checks = ["check_keeps_withdraw"] }
+test_hooks = { only_checks = ["check_keeps_withdraw"], baseline_solvers = [] }

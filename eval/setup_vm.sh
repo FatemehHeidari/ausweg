@@ -57,9 +57,32 @@ echo "$foundry_sha256  /tmp/foundry.tgz" | sha256sum -c -
 tar -xzf /tmp/foundry.tgz -C "$prefix/foundry/bin"
 rm /tmp/foundry.tgz
 
+# bitwuzla 0.8.1 and cvc5 1.2.1, for the solver baselines: the archives
+# Halmos 0.3.3 downloads for `--solver bitwuzla` and `--solver cvc5`, checked
+# against the sha256 it pins, and the binary read from each as Halmos reads
+# it. eval/config.toml pins the binaries' own sha256.
+mkdir -p "$prefix/solvers"
+solver() {
+    curl -sSfL -o /tmp/solver.zip "$1"
+    echo "$2  /tmp/solver.zip" | sha256sum -c -
+    python3 -I -c 'import sys, zipfile; sys.stdout.buffer.write(zipfile.ZipFile(sys.argv[1]).read(sys.argv[2]))' \
+        /tmp/solver.zip "$3" > "$prefix/solvers/$4"
+    chmod 755 "$prefix/solvers/$4"
+    rm /tmp/solver.zip
+}
+solver https://github.com/bitwuzla/bitwuzla/releases/download/0.8.1/Bitwuzla-Linux-x86_64-static.zip \
+    d88ca19bd0495df4e83296d37b8e3b5b588af0768623d674000c681b472bb1d8 \
+    Bitwuzla-Linux-x86_64-static/bin/bitwuzla bitwuzla
+solver https://github.com/cvc5/cvc5/releases/download/cvc5-1.2.1/cvc5-Linux-x86_64-static.zip \
+    6d44abc233980a14d72cc5809287d27c3335b1d6ee863381d0b5ffcbd0d8de56 \
+    cvc5-Linux-x86_64-static/bin/cvc5 cvc5
+
 "$prefix/bin/ausweg" --version
 "$prefix/venv/bin/halmos" --version
 "$prefix/venv/bin/z3" --version
 "$prefix/venv/bin/yices-smt2" --version
 "$prefix/foundry/bin/forge" --version | head -2
+"$prefix/solvers/bitwuzla" --version
+"$prefix/solvers/cvc5" --version | head -1
+sha256sum "$prefix/solvers/bitwuzla" "$prefix/solvers/cvc5"
 echo "ready: the runner is in $prefix/src/ausweg/eval"

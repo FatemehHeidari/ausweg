@@ -15,9 +15,16 @@ EVAL_LOG_DIR, and EVAL_BRANCH_TIMEOUT, given to every Halmos process as
 --solver-timeout-branching. EVAL_ONLY_CHECKS (comma-separated names) runs a
 subset, for the runner's own tests.
 
-Each check's record keeps its outcome, its time and Halmos's path count.
+Each check's record keeps its outcome, its time, Halmos's path count, the
+arguments ausweg gave, and the executables its processes ran, as the
+runner's logging shims wrote them to EVAL_EXEC_LOG while it ran. The
+runner's solver baselines run the same arguments again with another solver,
+and read each check's exit code, loop-bound count and solver runs from the
+record: a check Halmos decides without one solver query is decided alike by
+every solver.
 """
 
+import collections
 import json
 import os
 import re
@@ -59,6 +66,15 @@ def proof_checks(root, contract):
             names = re.findall(r"\bfunction\s+(check_\w+)\s*\(", body)
             return path, list(dict.fromkeys(names))
     return None, []
+
+
+def executed():
+    """Every executable the runner's logging shims have recorded so far in
+    this command's exec log, in order."""
+    try:
+        return files.read_lines(os.environ["EVAL_EXEC_LOG"])
+    except (KeyError, OSError):
+        return []
 
 
 def pump(stream, sinks):
@@ -111,7 +127,8 @@ def main():
         cmd = [real] + base + pinned + ["--match-test", f"^{name}\\(", "--json-output", jk]
         limit = min(cap, target_deadline - time.time())
         started = time.time()
-        rec = {"check": name, "cmd": cmd, "start": started, "limit_seconds": round(max(limit, 0), 3)}
+        rec = {"check": name, "cmd": cmd, "args": base, "start": started,
+               "limit_seconds": round(max(limit, 0), 3)}
         if limit <= 0:
             rec.update(outcome="not started: the target's budget was spent", seconds=0)
             entries.append({"name": f"{name}()", "exitcode": UNFINISHED, "num_models": 0, "models": [],
@@ -122,6 +139,7 @@ def main():
             continue
         out_log = open(os.path.join(log_dir, f"{contract}.{name}.stdout"), "wb")
         err_log = open(os.path.join(log_dir, f"{contract}.{name}.stderr"), "wb")
+        seen = len(executed())
         p = subprocess.Popen(cmd, cwd=os.getcwd(), stdout=subprocess.PIPE, stderr=err_log,
                              stdin=subprocess.DEVNULL)
         t = threading.Thread(target=pump, args=(p.stdout, [out_log, sys.stdout.buffer]), daemon=True)
@@ -141,7 +159,8 @@ def main():
         err_log.close()
         seconds = round(time.time() - started, 3)
         rec.update(seconds=seconds, returncode=p.returncode, left_running_and_stopped=left,
-                   still_running_after_stop=[n for _, n in proc.descendants(os.getpid())])
+                   still_running_after_stop=[n for _, n in proc.descendants(os.getpid())],
+                   executables_used=dict(collections.Counter(executed()[seen:])))
         if stopped:
             rec["outcome"] = "unfinished: stopped at its limit"
             entries.append({"name": f"{name}()", "exitcode": UNFINISHED, "num_models": 0, "models": [],
@@ -166,6 +185,7 @@ def main():
             entries.extend(got)
             rec["outcome"] = "completed"
             rec["halmos_exitcodes"] = [e.get("exitcode") for e in got]
+            rec["num_bounded_loops"] = [e.get("num_bounded_loops") for e in got]
             # Halmos's count: [paths explored, those ending without an error, those stuck].
             rec["num_paths"] = got[0].get("num_paths") if got else None
         if record:

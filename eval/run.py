@@ -6,22 +6,27 @@
 
 For each target, in the order listed: copy the project, build it, run
 `ausweg prove` with the frozen settings, replay each exit counterexample from
-deployment, then run the selected Gambit mutants and replay each kill on the
-original and on the mutant. Every command is saved with its arguments,
-working directory, environment, timing and raw output, in execution order
-(events.jsonl), and so is every tool executable it ran (each tool is reached
-through a logging shim in <out>/bin). Results go to <out>/<target>/result.json
-and <out>/summary.json.
+deployment, run ausweg's proof again with each of Halmos's own solvers in
+place of `ausweg smt` (the solver baselines), then run the selected Gambit
+mutants and replay each kill on the original and on the mutant. Every
+command is saved with its arguments, working directory, environment, timing
+and raw output, in execution order (events.jsonl), and so is every tool
+executable it ran (each tool is reached through a logging shim in <out>/bin,
+or, for the baselines' bitwuzla and cvc5, in <out>/solvers). Results go to
+<out>/<target>/result.json and <out>/summary.json.
 
 Budgets, per target (config.toml, [limits], says the same):
 - target_seconds, by the clock: copying and building the target, and
   ausweg's run on it as audited. ausweg is stopped at its end.
+- solver_seconds, by the clock, for each solver baseline: every check of
+  ausweg's proof, run again with that solver. Each solver has its own.
 - mutation_seconds, by the clock: choosing the functions, Gambit, and every
   mutant's copy, build and run. Nothing in it runs past its end.
 - replay_seconds, by the work done: every replay search and replay for the
   target and its mutants. Each is charged what it took.
-A target therefore takes at most target_seconds + mutation_seconds +
-replay_seconds, plus the runner's own bookkeeping between them.
+A target therefore takes at most target_seconds + solver_seconds for each
+solver + mutation_seconds + replay_seconds, plus the runner's own
+bookkeeping between them.
 
 --resume skips targets that have a result.json, and redoes one that was
 interrupted. --shard K/N runs every target whose position in the list, from
@@ -36,6 +41,7 @@ import json
 import os
 import platform
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -55,8 +61,16 @@ MIN_START = 5  # a step with less time left than this is not started
 # one, such as AUSWEG_SMT_SOLVER, is dropped.
 KEEP_ENV = ("HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TMPDIR", "TERM")
 SHIMS = {"forge": "forge", "halmos": "halmos", "z3": "z3", "yices-smt2": "yices"}
+# The other binaries of the solver baselines. Their shims are in
+# <out>/solvers, on no command's PATH: `ausweg smt` takes cvc5 or bitwuzla
+# from PATH when z3 or yices is missing there, and ausweg's runs keep the
+# solvers the smoke test ran them with.
+SOLVER_SHIMS = {"bitwuzla": "bitwuzla", "cvc5": "cvc5"}
 # Every tool a manifest records, each with its path and sha256.
-TOOLS = ("ausweg", "gambit", *SHIMS, "python3")
+TOOLS = ("ausweg", "gambit", *SHIMS, *SOLVER_SHIMS, "python3")
+# A baseline's per-check wrapper stops its checks this long before the
+# solver's budget ends, so that it records them before it is stopped.
+WRAPPER_RESERVE = 5
 
 REFUSALS = [
     r"not an ERC-4626 vault ausweg can prove",
@@ -117,23 +131,32 @@ def real_path(cmd):
     return os.path.realpath(p)
 
 
+def write_shim(shim, real):
+    """A script that logs `real` to the command's exec log, then runs it."""
+    with open(shim, "w") as f:
+        f.write("#!/bin/sh\n"
+                f"printf '%s\\n' '{real}' >> \"${{EVAL_EXEC_LOG:-/dev/null}}\"\n"
+                f"exec '{real}' \"$@\"\n")
+    os.chmod(shim, 0o755)
+
+
 class Run:
     def __init__(self, cfg, out):
         self.cfg = cfg
         self.out = out
         self.events = os.path.join(out, "events.jsonl")
         self.bin = os.path.join(out, "bin")
+        self.solvers = os.path.join(out, "solvers")
         os.makedirs(self.bin, exist_ok=True)
+        os.makedirs(self.solvers, exist_ok=True)
         t = cfg["tools"]
         self.real = {name: real_path(t[key]["bin"]) for name, key in SHIMS.items()}
         self.real["python3"] = os.path.realpath(sys.executable)
         for name, real in self.real.items():
-            shim = os.path.join(self.bin, name)
-            with open(shim, "w") as f:
-                f.write("#!/bin/sh\n"
-                        f"printf '%s\\n' '{real}' >> \"${{EVAL_EXEC_LOG:-/dev/null}}\"\n"
-                        f"exec '{real}' \"$@\"\n")
-            os.chmod(shim, 0o755)
+            write_shim(os.path.join(self.bin, name), real)
+        for name, key in SOLVER_SHIMS.items():
+            self.real[name] = real_path(t[key]["bin"])
+            write_shim(os.path.join(self.solvers, name), self.real[name])
         self.forge = os.path.join(self.bin, "forge")
         self.halmos = os.path.join(self.bin, "halmos")
         self.base_env = {k: os.environ[k] for k in KEEP_ENV if k in os.environ}
@@ -145,6 +168,14 @@ class Run:
         e["EVAL_EXEC_LOG"] = exec_log or os.path.join(self.out, "exec.log")
         e.update(extra or {})
         return e
+
+    def shim(self, tool):
+        """The shim name and path of a tool, by its key in config.toml."""
+        for names, where in ((SHIMS, self.bin), (SOLVER_SHIMS, self.solvers)):
+            for name, key in names.items():
+                if key == tool:
+                    return name, os.path.join(where, name)
+        raise KeyError(f"config.toml has no tool {tool!r} with a shim")
 
     def cmd(self, argv, cwd, deadline, logdir, tag, extra_env=None, label=""):
         """Run a command until it ends or the monotonic deadline passes."""
@@ -191,6 +222,8 @@ def tool_versions(run):
     out["halmos"]["reported"] = first_line([run.halmos, "--version"])
     out["z3"]["reported"] = first_line([os.path.join(run.bin, "z3"), "--version"])
     out["yices-smt2"]["reported"] = first_line([os.path.join(run.bin, "yices-smt2"), "--version"])
+    for name in SOLVER_SHIMS:
+        out[name]["reported"] = first_line([os.path.join(run.solvers, name), "--version"])
     try:
         forge_v = subprocess.run([run.forge, "--version"], capture_output=True, text=True, timeout=60,
                                  env=run.env()).stdout
@@ -203,19 +236,69 @@ def tool_versions(run):
     shebang = (files.read_lines(run.real["halmos"]) or [""])[0]
     py = shebang[2:].strip().split()[0] if shebang.startswith("#!") else None
     out["halmos"]["z3_module"] = first_line([py, "-c", "import z3; print(z3.get_version_string())"]) if py else None
+    names = [s["name"] for s in cfg.get("baselines", {}).get("solvers", [])]
+    out["halmos"]["solvers"] = halmos_solvers(run, py, names) if py and names else None
     problems = []
     for name, want in (("ausweg", t["ausweg"]["version"]), ("halmos", t["halmos"]["version"]),
                        ("z3", t["z3"]["version"]), ("yices-smt2", t["yices"]["version"]),
-                       ("forge", t["forge"]["version"])):
+                       ("forge", t["forge"]["version"]),
+                       *((name, t[key]["version"]) for name, key in SOLVER_SHIMS.items())):
         got = out[name]["reported"] or ""
         if not got.startswith(want):
             problems.append(f"{name}: expected {want!r}, found {got!r}")
+    problems += pin_problems(cfg, out)
     if out["forge"]["commit"] != t["forge"]["commit"]:
         problems.append(f"forge: expected commit {t['forge']['commit']}, found {out['forge']['commit']}")
     want_z3 = t["z3"]["version"].split()[-1]
     if not (out["halmos"]["z3_module"] or "").startswith(want_z3):
         problems.append(f"Halmos's z3 module: expected {want_z3}, found {out['halmos']['z3_module']!r}")
+    problems += solver_problems(cfg, out["halmos"]["solvers"]) if names else []
     return out, problems
+
+
+def pin_problems(cfg, out):
+    """Each tool whose config.toml pins its binary's sha256, against the
+    binary found."""
+    problems = []
+    for name, key in {**SHIMS, **SOLVER_SHIMS}.items():
+        want = cfg["tools"].get(key, {}).get("sha256")
+        if want and out.get(name, {}).get("sha256") != want:
+            problems.append(f"{name}: expected the binary with sha256 {want}, "
+                            f"found {out.get(name, {}).get('sha256')}")
+    return problems
+
+
+def halmos_solvers(run, py, names):
+    """What the installed Halmos runs for each `--solver <name>`: its own name
+    for the solver, the binary's file name and the arguments."""
+    code = ("import json, sys\n"
+            "from halmos.solvers import SOLVERS\n"
+            "print(json.dumps({n: {'name': SOLVERS[n].name, 'binary': SOLVERS[n].binary_name,\n"
+            "                      'arguments': SOLVERS[n].arguments} for n in sys.argv[1:] if n in SOLVERS}))\n")
+    try:
+        r = subprocess.run([py, "-I", "-c", code, *names], capture_output=True, text=True, timeout=60,
+                           env=run.env())
+        return json.loads(r.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+def solver_problems(cfg, table):
+    """Each solver baseline against the installed Halmos's `--solver`: the
+    same binary, by name, and the same arguments."""
+    problems = []
+    for s in cfg["baselines"]["solvers"]:
+        got = (table or {}).get(s["name"])
+        if got is None:
+            problems.append(f"solver {s['name']}: the installed Halmos has no such solver, or could not be asked")
+            continue
+        binary = os.path.basename(cfg["tools"][s["tool"]]["bin"])
+        if got["binary"] != binary:
+            problems.append(f"solver {s['name']}: Halmos runs {got['binary']!r}, and the tool {s['tool']} "
+                            f"is {binary!r}")
+        if got["arguments"] != s["arguments"]:
+            problems.append(f"solver {s['name']}: Halmos gives it {got['arguments']}, config.toml {s['arguments']}")
+    return problems
 
 
 def runner_commit():
@@ -431,6 +514,146 @@ def confirm(run, project, target_path, contract, abi, checks, budget, logdir, ta
     return out
 
 
+# ---------------------------------------------------------- solver baselines
+
+def halmos_class(entry):
+    """A check's class from its result in Halmos's JSON, by ausweg's rule
+    (src/prove.rs, parse_results): exit code 0 is a proof only when Halmos
+    counted the paths its loop bound cut and the count is 0; 1 is a
+    counterexample, 2 a timeout, 4 vacuous, and anything else an error."""
+    code = entry.get("exitcode")
+    if type(code) is not int:
+        return "error"
+    if code == 0:
+        bounded = entry.get("num_bounded_loops")
+        return "proved" if type(bounded) is int and bounded == 0 else "incomplete"
+    return {1: "counterexample", 2: "timeout", 4: "vacuous"}.get(code, "error")
+
+
+def baseline_classes(records, asked, stopped):
+    """Each check's class in a baseline, from the wrapper's record: unfinished
+    as check_classes reads ausweg's, and a completed check by ausweg's rule.
+    A check asked for with no record is unfinished if the run was stopped,
+    and an error if not."""
+    classes = {}
+    for rec in records:
+        outcome = rec.get("outcome", "")
+        codes, bounded = rec.get("halmos_exitcodes") or [], rec.get("num_bounded_loops") or []
+        if outcome.startswith(("unfinished", "not started")):
+            classes[rec["check"]] = "unfinished"
+        elif outcome == "completed" and len(codes) == 1 and len(bounded) == 1:
+            classes[rec["check"]] = halmos_class({"exitcode": codes[0], "num_bounded_loops": bounded[0]})
+        else:
+            classes[rec["check"]] = "error"
+    for c in asked:
+        classes.setdefault(c, "unfinished" if stopped else "error")
+    return classes
+
+
+def with_solver(args, command, query_seconds):
+    """ausweg's Halmos arguments with another solver command, and with
+    Halmos's own query limit in place of ausweg's. None unless they hold
+    exactly one --solver-command to replace, and no --solver."""
+    flags = ("--solver-command", "--solver-timeout-assertion")
+    if args.count(flags[0]) != 1 or args.count(flags[1]) > 1 or any(
+            a == "--solver" or a.startswith(tuple(f + "=" for f in ("--solver", *flags))) for a in args):
+        return None
+    out = list(args)
+    for flag, value in zip(flags, (command, f"{query_seconds}s")):
+        if flag not in out:
+            out += [flag, value]
+            continue
+        i = out.index(flag)
+        if i + 1 == len(out) or out[i + 1].startswith("--"):
+            return None
+        out[i + 1] = value
+    return out
+
+
+def solver_baselines(run, work, clean, classes, limits, logs, hooks):
+    """Halmos's own solvers, as controls on ausweg's proof (Step 23): every
+    check of the proof again, through the per-check wrapper, with the
+    arguments ausweg gave Halmos and each solver in place of `ausweg smt`.
+    Each solver runs as Halmos's `--solver <name>` would, as its pinned binary
+    with Halmos's own arguments for it, under the same branch, query and check
+    limits, within its own solver_seconds, whatever ausweg found. A baseline
+    is not a detector and nothing in it is replayed: a check that one solver
+    proved and the other refuted is a disagreement, to examine.
+
+    For the runner's own tests, test_hooks can name the solvers to run
+    (baseline_solvers) and the checks they run (baseline_checks)."""
+    args = next((r["args"] for r in clean["checks"] if r.get("args")), None)
+    if args is None:
+        return {"not_run": "ausweg ran Halmos on no check, so there is no proof to run again"}
+    picked = hooks.get("baseline_checks")
+    asked = [c for c in clean.get("asked") or [] if picked is None or c in picked]
+    only = picked or hooks.get("only_checks")
+    subset = hooks.get("baseline_solvers")
+    out = {"halmos_args": args, "solvers": {}, "disagreements": []}
+    for s in run.cfg["baselines"]["solvers"]:
+        name = s["name"]
+        shim_name, shim = run.shim(s["tool"])
+        command = shlex.join([shim, *s["arguments"]])
+        real = run.real[shim_name]
+        try:
+            digest = files.sha256(real)
+        except OSError:
+            digest = None
+        rec = out["solvers"][name] = {
+            "tool": s["tool"], "binary": {"path": real, "sha256": digest},
+            "arguments": s["arguments"], "solver_command": command, "budget_seconds": limits["solver_seconds"]}
+        if subset is not None and name not in subset:
+            rec["not_run"] = "the smoke test runs only " + (", ".join(subset) or "no solver") + " here"
+            continue
+        halmos_args = with_solver(args, command, limits["query_seconds"])
+        if halmos_args is None:
+            rec["not_run"] = "ausweg's Halmos arguments do not hold the one --solver-command to replace"
+            continue
+        window = Window(limits["solver_seconds"])
+        if not window.can_start():
+            rec["not_run"] = "the solver's budget is too short to start"
+            continue
+        tag = f"baseline-{name}"
+        record = os.path.join(logs, f"{tag}.checks.jsonl")
+        json_path = os.path.join(logs, f"{tag}.json")
+        for f in (record, json_path):
+            if os.path.exists(f):
+                os.remove(f)
+        extra = {
+            "EVAL_REAL_HALMOS": run.halmos,
+            "EVAL_CHECK_CAP": str(limits["check_seconds"]),
+            "EVAL_TARGET_DEADLINE": str(time.time() + (window.end - WRAPPER_RESERVE - time.monotonic())),
+            "EVAL_CHECK_RECORD": record,
+            "EVAL_LOG_DIR": os.path.join(logs, f"{tag}.halmos"),
+        }
+        if limits.get("branch_query_ms") is not None:
+            extra["EVAL_BRANCH_TIMEOUT"] = f"{limits['branch_query_ms']}ms"
+        if only:
+            extra["EVAL_ONLY_CHECKS"] = ",".join(only)
+        argv = [WRAPPER, *halmos_args, "--json-output", json_path]
+        r = run.cmd(argv, work, window.end, logs, tag, extra_env=extra, label=f"solver baseline {name}")
+        records = [json.loads(ln) for ln in files.read_lines(record)] if os.path.exists(record) else []
+        got = baseline_classes(records, asked, r["status"] != "exited")
+        runs = {x["check"]: (x.get("executables_used") or {}).get(real, 0) for x in records}
+        rec.update({
+            "argv": argv,
+            "run": {k: r[k] for k in ("seconds", "status", "returncode", "left_running_and_stopped",
+                                      "still_running_after_stop", "executables_used")},
+            "budget_left": round(window.left(), 3),
+            "checks": got,
+            "counts": dict(sorted(collections.Counter(got.values()).items())),
+            # How many times each check ran the solver: a check Halmos decided
+            # with no query is decided alike by every solver.
+            "solver_runs": {c: runs.get(c, 0) for c in got},
+            "wrapper_checks": records,
+        })
+        for c, v in got.items():
+            if {v, classes.get(c)} == {"proved", "counterexample"}:
+                out["disagreements"].append({"check": c, "solver": name, "by_ausweg_smt": classes.get(c),
+                                             "by_solver": v})
+    return out
+
+
 # ------------------------------------------------------------------- targets
 
 def build(run, work, deadline, logdir, tag):
@@ -463,11 +686,13 @@ def run_target(run, t, original_hash):
     if not built:
         res["class"] = "other inconclusive" if built is False else "unfinished"
         res["why"] = "the project does not build" if built is False else "the target's budget was spent"
+        res["baselines"] = {"not_run": f"no proof to run again: {res['why']}"}
         return finish(res, t, original_hash, started, window)
     name = os.path.splitext(os.path.basename(t["contract"]))[0]
     abi = files.read_json(os.path.join(work, "out", os.path.basename(t["contract"]), f"{name}.json"))["abi"]
     if not window.can_start():
-        res.update({"class": "unfinished", "why": "the target's budget was spent before the proof"})
+        res.update({"class": "unfinished", "why": "the target's budget was spent before the proof",
+                    "baselines": {"not_run": "no proof to run again: the target's budget was spent before it"}})
         return finish(res, t, original_hash, started, window)
     clean = prove(run, work, t["contract"], window, logs, "prove", only=hooks.get("only_checks"), hooks=hooks)
     classes = check_classes(clean)
@@ -491,6 +716,8 @@ def run_target(run, t, original_hash):
                   "executables_used": clean["run"]["executables_used"],
                   "wrapper_checks": clean["checks"]},
     })
+    res["baselines"] = ({"not_run": "ausweg does not support the target"} if res["refusal"] else
+                        solver_baselines(run, work, clean, classes, limits, logs, hooks))
     if t.get("mutate"):
         res["mutation"] = run_mutants(run, t, work, name, abi, classes, replay_budget, logs, hooks, limits)
     res["replay_seconds_left"] = round(replay_budget.left(), 3)
@@ -704,16 +931,34 @@ def main(argv=None):
         os.makedirs(tdir, exist_ok=True)
         files.write_json(done, r)
         print(f"   {r['class']}" + (f" ({r.get('why')})" if r.get("why") else ""), flush=True)
+        for d in (r.get("baselines") or {}).get("disagreements", []):
+            print(f"   disagreement on {d['check']}: ausweg smt {d['by_ausweg_smt']}, "
+                  f"{d['solver']} {d['by_solver']}", flush=True)
     results = [files.read_json(os.path.join(a.out, t["id"], "result.json")) for t in targets
                if os.path.exists(os.path.join(a.out, t["id"], "result.json"))]
     summary = {"finished": time.time(), "shard": a.shard,
                "targets": {r["id"]: {"class": r["class"], "checks": r.get("checks"),
                                      "mutation": (r.get("mutation") or {}).get("counts"),
                                      "kill_rate": (r.get("mutation") or {}).get("kill_rate"),
+                                     "baselines": baseline_summary(r),
                                      "original_unchanged": r.get("original_unchanged"),
                                      "project_sha256": r.get("project_sha256"),
                                      "seconds": r.get("seconds")} for r in results}}
     files.write_json(os.path.join(a.out, "summary.json"), summary)
+
+
+def baseline_summary(result):
+    """A target's solver baselines, for a summary: each solver's classes,
+    counts and solver runs per check, or why it did not run, and every
+    disagreement."""
+    b = result.get("baselines") or {"not_run": "the result has no baselines"}
+    if "not_run" in b:
+        return {"not_run": b["not_run"]}
+    return {"solvers": {n: {"not_run": s["not_run"]} if "not_run" in s else
+                        {"checks": s["checks"], "counts": s["counts"], "solver_runs": s.get("solver_runs"),
+                         "seconds": s["run"]["seconds"]}
+                        for n, s in b["solvers"].items()},
+            "disagreements": b["disagreements"]}
 
 
 if __name__ == "__main__":

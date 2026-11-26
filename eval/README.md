@@ -6,6 +6,16 @@ classifies every result. ERC-7540 targets have no replay yet, so a
 counterexample on one stays unconfirmed. Step 21 lists the settings; Step 22 describes the
 runner and its smoke test.
 
+On each target ausweg supports, the runner also runs ausweg's proof again
+with each of Halmos's own solvers, yices, bitwuzla and cvc5-int, in place of
+`ausweg smt` (Step 23). A solver gets the arguments ausweg gave Halmos, the
+same branch, query and check limits, and an hour of its own, and runs as
+Halmos's `--solver` would: its pinned binary, with Halmos's arguments for it.
+These baselines are controls, not detectors: a check that `ausweg smt` and a
+solver decide differently, one proving it and the other refuting it, is
+listed in the summaries as a disagreement, to examine before any result is
+reported.
+
 ## On a fresh VM
 
 Ubuntu 24.04, as root, with the ausweg commit that holds this runner:
@@ -32,7 +42,9 @@ any tool's sha256 does: one version built on two VMs need not be the same
 bytes. A shard, the first included, with no record or no hash of a tool is
 refused too. So before starting the shards, compare
 `sha256sum /opt/ausweg-eval/bin/*` across the VMs, and if ausweg's or Gambit's
-builds differ, copy one VM's binaries to the others. Start the run inside
+builds differ, copy one VM's binaries to the others. The solvers in
+`/opt/ausweg-eval/solvers` need no comparison: the runner refuses any but the
+binaries whose sha256 `config.toml` gives. Start the run inside
 `tmux` so it outlives the SSH session.
 
 ```sh
@@ -46,8 +58,8 @@ a child subreaper.
 
 | File | Role |
 | --- | --- |
-| `run.py` | The runner: builds, proves, classifies, replays, mutates, records; resume and shards |
-| `halmos_per_check.py` | Given to `ausweg prove` as `--halmos`: one Halmos process per check, each with its own limit |
+| `run.py` | The runner: builds, proves, classifies, replays, runs the solver baselines, mutates, records; resume and shards |
+| `halmos_per_check.py` | Given to `ausweg prove` as `--halmos`: one Halmos process per check, each with its own limit; the solver baselines run it too |
 | `replay.py` | The search from deployment, and the replay of what it finds |
 | `templates/Erc4626Replay.sol`, `templates/ReplayToken.sol` | The search's handler and exit properties, written apart from ausweg's proof |
 | `mutate.py` | Which functions Gambit mutates, and the mutants' project copies |
@@ -55,7 +67,7 @@ a child subreaper.
 | `config.toml` | The settings, with what each budget covers |
 | `setup_vm.sh` | Installs every tool at its frozen version on a fresh VM |
 | `gambit-Cargo.lock`, `requirements-halmos.txt` | The versions of Gambit's and Halmos's dependencies, which their releases leave open |
-| `merge.py` | Merges the shards of one evaluation |
+| `merge.py` | Merges the shards of one evaluation, and lists every disagreement with a solver baseline |
 | `test_runner.py` | Regression tests for the runner, without Foundry or solvers |
 | `smoke.toml`, `smoke_check.py`, `smoke/` | The smoke test, its project, and the check of its results |
 

@@ -9,6 +9,7 @@ was before the fix.
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -183,23 +184,39 @@ class ToolsAreTheConfiguredOnes(Tmp):
     """ausweg finds z3 and yices on PATH, or takes them from AUSWEG_SMT_*
     variables, so a run could use other solvers than the ones checked."""
 
-    def test_commands_reach_only_the_configured_tools(self):
-        for name in ("z3", "yices-smt2", "forge", "halmos"):
+    def run_and_env(self):
+        for name in ("z3", "yices-smt2", "forge", "halmos", "bitwuzla", "cvc5"):
             write(self.p("decoy", name), "#!/bin/sh\necho decoy\n", 0o755)
             write(self.p("frozen", name), f"#!/bin/sh\necho frozen {name}\n", 0o755)
         cfg = {"tools": {"forge": {"bin": self.p("frozen", "forge")}, "halmos": {"bin": self.p("frozen", "halmos")},
-                         "z3": {"bin": self.p("frozen", "z3")}, "yices": {"bin": self.p("frozen", "yices-smt2")}}}
+                         "z3": {"bin": self.p("frozen", "z3")}, "yices": {"bin": self.p("frozen", "yices-smt2")},
+                         "bitwuzla": {"bin": self.p("frozen", "bitwuzla")}, "cvc5": {"bin": self.p("frozen", "cvc5")}}}
         env = {"PATH": self.p("decoy") + os.pathsep + os.environ["PATH"], "AUSWEG_SMT_SOLVER": self.p("decoy", "z3"),
                "AUSWEG_SMT_FALLBACK": "decoy", "AUSWEG_SMT_CHECKER": "decoy", "HOME": os.environ.get("HOME", "/")}
         with mock.patch.dict(os.environ, env, clear=True):
             run = runner.Run(cfg, self.p("out"))
-            e = run.env(exec_log=self.p("exec.log"))
+            return run, run.env(exec_log=self.p("exec.log"))
+
+    def test_commands_reach_only_the_configured_tools(self):
+        run, e = self.run_and_env()
         self.assertFalse([k for k in e if k.startswith("AUSWEG_")])
         self.assertEqual(e["PATH"].split(os.pathsep)[0], run.bin)
         got = subprocess.run(["sh", "-c", "z3; yices-smt2; forge; halmos"], env=e, capture_output=True, text=True)
         self.assertEqual(got.stdout.split("\n")[:4], ["frozen z3", "frozen yices-smt2", "frozen forge", "frozen halmos"])
         used = files.read_text(self.p("exec.log")).split()
         self.assertEqual(used, [os.path.realpath(self.p("frozen", n)) for n in ("z3", "yices-smt2", "forge", "halmos")])
+
+    def test_the_baselines_bitwuzla_and_cvc5_are_on_no_commands_path(self):
+        """ausweg looks for cvc5 and bitwuzla on PATH when z3 or yices is
+        missing there: its runs must not find the baselines' solvers."""
+        run, e = self.run_and_env()
+        self.assertNotIn(run.solvers, e["PATH"].split(os.pathsep))
+        for name in ("bitwuzla", "cvc5"):
+            found = shutil.which(name, path=e["PATH"])
+            self.assertFalse(found and os.path.realpath(found) == os.path.realpath(self.p("frozen", name)), found)
+        got = subprocess.run([run.shim("bitwuzla")[1]], env=e, capture_output=True, text=True)
+        self.assertEqual(got.stdout, "frozen bitwuzla\n")
+        self.assertEqual(files.read_text(self.p("exec.log")).split(), [os.path.realpath(self.p("frozen", "bitwuzla"))])
 
 
 class StoppedMeansStopped(Tmp):
@@ -307,17 +324,20 @@ class TheWrapperPinsTheBranchTimeout(Tmp):
               "contract VProof {\n  function check_a() public {}\n}\n")
         write(self.p("halmos"), textwrap.dedent(f"""\
             #!{sys.executable}
-            import json, sys
+            import json, os, sys
             a = sys.argv[1:]
             with open({self.p("argv")!r}, "a") as f:
                 f.write(json.dumps(a) + "\\n")
+            with open(os.environ["EVAL_EXEC_LOG"], "a") as f:
+                f.write("/x/solver\\n/x/solver\\n")
             result = {{"name": "check_a()", "exitcode": 0, "num_models": 0, "models": [],
                        "num_paths": [7, 7, 0], "time": [0.1, 0.1, 0], "num_bounded_loops": 0}}
             with open(a[a.index("--json-output") + 1], "w") as f:
                 json.dump({{"exitcode": 0, "test_results": {{"test/generated/V.proof.t.sol:VProof": [result]}}}}, f)
             """), 0o755)
+        write(self.p("exec.log"), "/x/before\n")
         env = dict(os.environ, EVAL_REAL_HALMOS=self.p("halmos"), EVAL_CHECK_RECORD=self.p("checks.jsonl"),
-                   EVAL_LOG_DIR=self.p("logs"), EVAL_BRANCH_TIMEOUT="1ms")
+                   EVAL_LOG_DIR=self.p("logs"), EVAL_BRANCH_TIMEOUT="1ms", EVAL_EXEC_LOG=self.p("exec.log"))
         return subprocess.run([sys.executable, "-I", halmos_per_check.__file__, "--root", self.p("work"),
                                "--contract", "VProof", "--json-output", self.p("merged.json"), *extra],
                               cwd=self.p("work"), env=env, capture_output=True, text=True, timeout=60)
@@ -332,10 +352,201 @@ class TheWrapperPinsTheBranchTimeout(Tmp):
         rec = json.loads(files.read_lines(self.p("checks.jsonl"))[0])
         self.assertEqual((rec["outcome"], rec["num_paths"]), ("completed", [7, 7, 0]))
 
+    def test_each_record_keeps_auswegs_arguments_the_loop_bound_count_and_the_solver_runs(self):
+        """The solver baselines run ausweg's Halmos arguments again, read a
+        check's verdict from its record as ausweg reads Halmos's, and count
+        the solver runs of that check alone."""
+        r = self.wrapper("--loop", "2")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        rec = json.loads(files.read_lines(self.p("checks.jsonl"))[0])
+        self.assertEqual(rec["args"], ["--root", self.p("work"), "--contract", "VProof", "--loop", "2"])
+        self.assertEqual((rec["halmos_exitcodes"], rec["num_bounded_loops"]), ([0], [0]))
+        self.assertEqual(rec["executables_used"], {"/x/solver": 2})
+
     def test_a_second_branch_timeout_is_refused(self):
         r = self.wrapper("--solver-timeout-branching", "5ms")
         self.assertNotEqual(r.returncode, 0)
         self.assertFalse(os.path.exists(self.p("argv")), "Halmos never ran")
+
+
+class SolverBaselinesRunAuswegsProofAgain(Tmp):
+    """Halmos's own solvers run every check of ausweg's proof again, with the
+    arguments ausweg gave Halmos and each solver in place of `ausweg smt`, as
+    Halmos's `--solver` would run it, under the same limits and a budget of
+    their own. A check one solver proved and the other refuted is flagged."""
+
+    ARGS = ["--root", ".", "--contract", "VProof", "--solver-command", "/opt/ausweg-eval/bin/ausweg smt",
+            "--solver-timeout-assertion", "65s", "--loop", "2"]
+    CHECKS = ["check_a", "check_b", "check_c"]
+    AUSWEG = {"check_a": "proved", "check_b": "proved", "check_c": "counterexample"}
+
+    def setUp(self):
+        super().setUp()
+        write(self.p("work", "test", "generated", "V.proof.t.sol"),
+              "contract VProof {\n" + "".join(f"  function {c}() public {{}}\n" for c in self.CHECKS) + "}\n")
+        for name in ("forge", "z3", "yices-smt2", "bitwuzla", "cvc5"):
+            write(self.p("frozen", name), "#!/bin/sh\nexit 0\n", 0o755)
+        # Runs the solver command once, then answers the check as plan.json
+        # says for that solver's file name: [exit code, loop-bound count].
+        write(self.p("frozen", "halmos"), textwrap.dedent(f"""\
+            #!{sys.executable}
+            import json, os, shlex, subprocess, sys, time
+            a = sys.argv[1:]
+            with open({self.p("argv.jsonl")!r}, "a") as f:
+                f.write(json.dumps(a) + "\\n")
+            command = shlex.split(a[a.index("--solver-command") + 1])
+            subprocess.run(command + ["query.smt2"])
+            plan = json.load(open({self.p("plan.json")!r})).get(os.path.basename(command[0]), {{}})
+            time.sleep(plan.get("sleep", 0))
+            check = a[a.index("--match-test") + 1][1:-2]
+            code, bounded = plan.get(check, [0, 0])
+            result = {{"name": check + "()", "exitcode": code, "num_models": 0, "models": [],
+                       "num_paths": [3, 3, 0], "time": [0.1, 0.1, 0], "num_bounded_loops": bounded}}
+            with open(a[a.index("--json-output") + 1], "w") as f:
+                json.dump({{"exitcode": code, "test_results": {{"test/generated/V.proof.t.sol:VProof": [result]}}}}, f)
+            """), 0o755)
+        frozen = files.read_toml(os.path.join(runner.HERE, "config.toml"))
+        self.limits = frozen["limits"]
+        cfg = {"tools": {key: {"bin": self.p("frozen", name)} for key, name in (
+                   ("forge", "forge"), ("halmos", "halmos"), ("z3", "z3"), ("yices", "yices-smt2"),
+                   ("bitwuzla", "bitwuzla"), ("cvc5", "cvc5"))},
+               "baselines": frozen["baselines"]}
+        self.run = runner.Run(cfg, self.p("out"))
+        self.plan({})
+
+    def plan(self, plan):
+        write(self.p("plan.json"), json.dumps(plan))
+
+    def baselines(self, args=ARGS, hooks=None, **limits):
+        clean = {"checks": [{"check": "check_a", "args": args}] if args else [], "asked": self.CHECKS}
+        return runner.solver_baselines(self.run, self.p("work"), clean, self.AUSWEG, dict(self.limits, **limits),
+                                       self.p("logs"), hooks or {})
+
+    def argv(self):
+        return [json.loads(x) for x in files.read_lines(self.p("argv.jsonl"))]
+
+    def test_each_solver_runs_every_check_as_halmos_would_run_it(self):
+        b = self.baselines()
+        want = [shlex.join([self.run.shim(s["tool"])[1], *s["arguments"]])
+                for s in self.run.cfg["baselines"]["solvers"]]
+        argv = self.argv()
+        self.assertEqual([a[a.index("--solver-command") + 1] for a in argv], [w for w in want for _ in self.CHECKS])
+        self.assertEqual([a[a.index("--match-test") + 1] for a in argv[:3]], [f"^{c}\\(" for c in self.CHECKS])
+        for a in argv:
+            self.assertNotIn("/opt/ausweg-eval/bin/ausweg smt", a)
+            self.assertEqual([a[a.index(f) + 1] for f in ("--root", "--contract", "--loop",
+                                                          "--solver-timeout-assertion", "--solver-timeout-branching")],
+                             [".", "VProof", "2", f"{self.limits['query_seconds']}s",
+                              f"{self.limits['branch_query_ms']}ms"])
+        bw = b["solvers"]["bitwuzla"]
+        real = os.path.realpath(self.p("frozen", "bitwuzla"))
+        self.assertEqual(bw["binary"], {"path": real, "sha256": files.sha256(real)})
+        self.assertEqual((bw["arguments"], bw["run"]["executables_used"][real]), (["--produce-models"], 3))
+        self.assertEqual(bw["solver_runs"], dict.fromkeys(self.CHECKS, 1))
+
+    def test_verdicts_are_read_as_ausweg_reads_them_and_disagreements_flagged(self):
+        self.plan({"yices-smt2": {"check_c": [1, 0]},
+                   "bitwuzla": {"check_a": [1, 0], "check_b": [2, 0]},
+                   "cvc5": {"check_a": [0, 1], "check_b": [4, 0], "check_c": [5, 0]}})
+        b = self.baselines()
+        self.assertEqual({n: s["checks"] for n, s in b["solvers"].items()}, {
+            "yices": {"check_a": "proved", "check_b": "proved", "check_c": "counterexample"},
+            "bitwuzla": {"check_a": "counterexample", "check_b": "timeout", "check_c": "proved"},
+            "cvc5-int": {"check_a": "incomplete", "check_b": "vacuous", "check_c": "error"}})
+        self.assertEqual(b["disagreements"], [
+            {"check": "check_a", "solver": "bitwuzla", "by_ausweg_smt": "proved", "by_solver": "counterexample"},
+            {"check": "check_c", "solver": "bitwuzla", "by_ausweg_smt": "counterexample", "by_solver": "proved"}])
+
+    def test_a_solver_stops_at_its_own_budget_and_the_next_one_gets_its_own(self):
+        self.plan({"bitwuzla": {"sleep": 30}})
+        b = self.baselines(solver_seconds=runner.WRAPPER_RESERVE + 3)
+        bw = b["solvers"]["bitwuzla"]
+        self.assertEqual(bw["checks"], dict.fromkeys(self.CHECKS, "unfinished"))
+        self.assertLess(bw["run"]["seconds"], runner.WRAPPER_RESERVE + 3)
+        self.assertEqual(bw["wrapper_checks"][0]["left_running_and_stopped"][0], "halmos")
+        self.assertEqual(bw["run"]["still_running_after_stop"], [])
+        self.assertEqual(b["solvers"]["cvc5-int"]["checks"], dict.fromkeys(self.CHECKS, "proved"))
+
+    def test_each_check_stops_at_the_check_cap(self):
+        self.plan({"bitwuzla": {"sleep": 30}})
+        b = self.baselines(check_seconds=1)
+        bw = b["solvers"]["bitwuzla"]
+        self.assertEqual(bw["checks"], dict.fromkeys(self.CHECKS, "unfinished"))
+        self.assertEqual([r["limit_seconds"] for r in bw["wrapper_checks"]], [1, 1, 1])
+        self.assertLess(bw["run"]["seconds"], 10)
+
+    def test_no_baseline_without_auswegs_arguments_to_run_again(self):
+        self.assertIn("not_run", self.baselines(args=None))
+        b = self.baselines(args=["--root", ".", "--contract", "VProof", "--solver", "yices"])
+        self.assertEqual([("not_run" in s) for s in b["solvers"].values()], [True, True, True])
+        self.assertFalse(os.path.exists(self.p("argv.jsonl")), "Halmos never ran")
+
+    def test_the_smoke_test_can_run_a_subset_of_the_solvers_and_checks(self):
+        b = self.baselines(hooks={"baseline_solvers": ["yices"], "baseline_checks": ["check_b"]})
+        self.assertEqual([n for n, s in b["solvers"].items() if "not_run" not in s], ["yices"])
+        self.assertEqual(b["solvers"]["yices"]["checks"], {"check_b": "proved"})
+        self.assertEqual([a[a.index("--match-test") + 1] for a in self.argv()], ["^check_b\\("])
+
+
+class BaselineVerdictsAreAusweg(unittest.TestCase):
+    """A baseline's verdicts must mean what ausweg's mean."""
+
+    def test_halmos_results_read_by_auswegs_rule(self):
+        # The results of prove.rs's own tests of parse_results, then the edges
+        # of its types: a count must be a JSON integer, an exit code too.
+        cases = [({"exitcode": 1, "num_bounded_loops": 0}, "counterexample"),
+                 ({"exitcode": 0, "num_bounded_loops": 0}, "proved"),
+                 ({"exitcode": 2}, "timeout"),
+                 ({"exitcode": 0, "num_bounded_loops": 1}, "incomplete"),
+                 ({"exitcode": 0, "num_paths": [1, 1, 0]}, "incomplete"),
+                 ({"exitcode": 0, "num_bounded_loops": "two"}, "incomplete"),
+                 ({"exitcode": 1, "num_bounded_loops": 3}, "counterexample"),
+                 ({"exitcode": 4, "num_bounded_loops": 0}, "vacuous"),
+                 ({"exitcode": 0, "num_bounded_loops": None}, "incomplete"),
+                 ({"exitcode": 0, "num_bounded_loops": False}, "incomplete"),
+                 ({"exitcode": 0, "num_bounded_loops": 0.0}, "incomplete"),
+                 ({"exitcode": 0, "num_bounded_loops": -1}, "incomplete"),
+                 ({"exitcode": 3}, "error"), ({"exitcode": 5}, "error"), ({"exitcode": 124}, "error"),
+                 ({}, "error"), ({"exitcode": False, "num_bounded_loops": 0}, "error"),
+                 ({"exitcode": 0.0, "num_bounded_loops": 0}, "error")]
+        self.assertEqual([runner.halmos_class(e) for e, _ in cases], [c for _, c in cases])
+
+    def test_a_check_with_no_finished_result_is_never_proved(self):
+        def rec(check, outcome, codes=(0,), bounded=(0,)):
+            return {"check": check, "outcome": outcome, "halmos_exitcodes": list(codes),
+                    "num_bounded_loops": list(bounded)}
+        records = [rec("a", "unfinished: stopped at its limit"), rec("b", "not started: the target's budget was spent"),
+                   rec("c", "Halmos wrote no result"), rec("d", "completed", (0, 0), (0, 0)), rec("e", "completed")]
+        asked = ["a", "b", "c", "d", "e", "f"]
+        self.assertEqual(runner.baseline_classes(records, asked, stopped=False),
+                         {"a": "unfinished", "b": "unfinished", "c": "error", "d": "error", "e": "proved", "f": "error"})
+        self.assertEqual(runner.baseline_classes(records[:1], ["a", "f"], stopped=True),
+                         {"a": "unfinished", "f": "unfinished"})
+
+    def test_the_solver_command_is_replaced_only_when_unambiguous(self):
+        args = ["--root", ".", "--solver-command", "a smt", "--solver-timeout-assertion", "65s", "--loop", "2"]
+        self.assertEqual(runner.with_solver(args, "b x", 60),
+                         ["--root", ".", "--solver-command", "b x", "--solver-timeout-assertion", "60s", "--loop", "2"])
+        self.assertEqual(runner.with_solver(["--solver-command", "a"], "b", 5),
+                         ["--solver-command", "b", "--solver-timeout-assertion", "5s"])
+        for bad in (["--root", "."], ["--solver-command"], ["--solver-command", "a", "--solver-command", "c"],
+                    ["--solver-command", "a", "--solver", "z3"], ["--solver-command=a"],
+                    ["--solver-command", "--loop", "2"], ["--solver-command", "a", "--solver-timeout-assertion"],
+                    ["--solver-command", "a", "--solver-timeout-assertion=65s"],
+                    ["--solver-command", "a", "--solver-timeout-assertion", "1s", "--solver-timeout-assertion", "2s"]):
+            self.assertIsNone(runner.with_solver(bad, "b", 60), bad)
+
+    def test_a_solver_must_be_the_binary_halmos_runs_with_halmos_arguments(self):
+        cfg = {"tools": {"bitwuzla": {"bin": "/x/solvers/bitwuzla", "sha256": "ab" * 32}},
+               "baselines": {"solvers": [{"name": "bitwuzla", "tool": "bitwuzla", "arguments": ["--produce-models"]}]}}
+        halmos = {"name": "bitwuzla-0.8.1", "binary": "bitwuzla", "arguments": ["--produce-models"]}
+        self.assertEqual(runner.solver_problems(cfg, {"bitwuzla": halmos}), [])
+        for table in ({"bitwuzla": dict(halmos, arguments=[])}, {"bitwuzla": dict(halmos, binary="bitwuzla-abs")},
+                      {}, None):
+            self.assertEqual(len(runner.solver_problems(cfg, table)), 1, table)
+        self.assertEqual(runner.pin_problems(cfg, {"bitwuzla": {"sha256": "ab" * 32}}), [])
+        self.assertEqual(len(runner.pin_problems(cfg, {"bitwuzla": {"sha256": "cd" * 32}})), 1)
+        self.assertEqual(len(runner.pin_problems(cfg, {})), 1)
 
 
 class TheRunnerReadsWhatToolsWrote(Tmp):
@@ -380,7 +591,12 @@ class ResumeAndShard(Tmp):
         if t["id"] == getattr(self, "crash_on", None):
             os.makedirs(os.path.join(run.out, t["id"]), exist_ok=True)
             raise KeyboardInterrupt
-        return {"id": t["id"], "class": "proved"}
+        if t["id"] == getattr(self, "disagree_on", None):
+            d = {"check": "check_x", "solver": "bitwuzla", "by_ausweg_smt": "proved", "by_solver": "counterexample"}
+            solver = {"checks": {"check_x": "counterexample"}, "counts": {"counterexample": 1}, "run": {"seconds": 1}}
+            return {"id": t["id"], "class": "proved", "baselines": {"solvers": {"bitwuzla": solver},
+                                                                     "disagreements": [d]}}
+        return {"id": t["id"], "class": "proved", "baselines": {"not_run": "ausweg does not support the target"}}
 
     def main(self, *extra, out="out"):
         argv = ["--config", self.p("config.toml"), "--targets", self.p("targets.toml"), "--out", self.p(out), *extra]
@@ -439,6 +655,18 @@ class ResumeAndShard(Tmp):
         self.merge("s1", "s2")
         summary = files.read_json(self.p("merged", "summary.json"))
         self.assertEqual(sorted(summary["targets"]), ["t0", "t1", "t2", "t3", "t4"])
+
+    def test_the_summaries_list_every_disagreement_with_a_solver(self):
+        self.disagree_on = "t3"
+        self.main("--shard", "1/2", out="s1")
+        self.main("--shard", "2/2", out="s2")
+        self.merge("s1", "s2")
+        merged = files.read_json(self.p("merged", "summary.json"))
+        want = {"check": "check_x", "solver": "bitwuzla", "by_ausweg_smt": "proved", "by_solver": "counterexample"}
+        self.assertEqual(merged["disagreements"], [dict(target="t3", **want)])
+        shard = files.read_json(self.p("s2", "summary.json"))["targets"]
+        self.assertEqual(shard["t3"]["baselines"]["disagreements"], [want])
+        self.assertEqual(shard["t1"]["baselines"], {"not_run": "ausweg does not support the target"})
 
     def test_a_merge_refuses_another_targets_file(self):
         self.main("--shard", "1/2", out="s1")
