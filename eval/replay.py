@@ -99,7 +99,8 @@ def _forge_env(env, settings):
 
 
 def _results(stdout_path):
-    """forge test --json: {test name: (status, reason)}."""
+    """forge test --json: {test name: (status, reason)}, with each invariant
+    under its own name."""
     text = files.read_text(stdout_path, errors="replace")
     start = text.find("{")
     out = {}
@@ -111,6 +112,14 @@ def _results(stdout_path):
         return out
     for suite in data.values():
         for name, r in (suite.get("test_results") or {}).items():
+            preds = r.get("invariant_predicate_results")
+            if preds:
+                # forge 1.9 runs a contract's invariants as one test, named
+                # after the first, and gives each invariant's outcome here.
+                why = {x.get("name"): x.get("reason") for x in r.get("invariant_failures") or []}
+                for p in preds:
+                    out[p["name"]] = (p.get("status"), p.get("reason") or why.get(p["name"]))
+                continue
             reason = r.get("reason")
             if not reason:
                 # An invariant test keeps its reason with each broken invariant.
@@ -120,11 +129,12 @@ def _results(stdout_path):
     return out
 
 
-def search(project, checks, deadline, settings, forge, env, logdir, record, seed0):
-    """Look for a failure of the exit properties behind `checks` until one is
-    found or the monotonic `deadline` passes. Each campaign has its own seed:
-    seed0, seed0 + 1, ... Returns (failures, campaigns): failures maps a check
-    to {invariant, reason, seed, sequence}."""
+def search(project, checks, deadline, settings, forge, env, logdir, record, seed0, first=False):
+    """Look for a failure of each exit property behind `checks` until each is
+    found or the monotonic `deadline` passes; with `first`, only until a
+    campaign finds one. Each campaign has its own seed: seed0, seed0 + 1, ...
+    Returns (failures, campaigns): failures maps a check to {invariant,
+    reason, seed, sequence}."""
     wanted = {PROPERTIES[c][0]: c for c in checks if c in PROPERTIES}
     found, campaigns = {}, []
     seed = seed0
@@ -160,7 +170,7 @@ def search(project, checks, deadline, settings, forge, env, logdir, record, seed
             found[check] = {"invariant": inv, "reason": reason, "seed": seed, "sequence": seq,
                             "saved": keep}
             del wanted[inv]
-        if r["status"] != "exited":
+        if r["status"] != "exited" or (first and found):
             break
         seed += 1
     return found, campaigns

@@ -25,6 +25,7 @@ import halmos_per_check  # noqa: E402
 import merge  # noqa: E402
 import mutate  # noqa: E402
 import proc  # noqa: E402
+import replay  # noqa: E402
 import run as runner  # noqa: E402
 
 proc.become_subreaper()
@@ -119,6 +120,105 @@ class Erc7540CounterexamplesSayTheyHaveNoReplay(unittest.TestCase):
             self.assertEqual(out[c], {"confirmed": False,
                                       "why": "No ERC-7540 replay implemented; counterexample remains unconfirmed."})
         self.assertIn("not an exit property", out["check_keeps_deposit"]["why"])
+
+
+class TheSearchReadsEachInvariant(Tmp):
+    """forge 1.9 runs a contract's invariants as one test, named after the
+    first. A search for two or three exit properties read only that name, so
+    it never found a failure of the others, and charged the failure to the
+    first: a counterexample ausweg found on two exits stayed unconfirmed."""
+
+    def outcome(self, failing):
+        """forge's JSON for one campaign of the search, as forge 1.9.0 writes it."""
+        names = sorted(replay.PROPERTIES[c][0] for c in replay.PROPERTIES)
+        preds = [{"name": n, "status": "Failure", "reason": f"{n}: broken"} if n in failing else
+                 {"name": n, "status": "Success"} for n in names]
+        return {"test/eval-replay/AuswegEvalSearch.t.sol:AuswegEvalSearch": {"test_results": {f"{names[0]}()": {
+            "status": "Failure" if failing else "Success", "reason": None, "invariant_predicate_results": preds,
+            "invariant_failures": [{"name": n, "reason": f"{n}: broken"} for n in names if n in failing]}}}}
+
+    def test_each_invariant_has_its_own_outcome(self):
+        out = self.outcome({"invariant_exit_withdraw"})
+        want = {"invariant_exit_max_redeem": ("Success", None), "invariant_exit_redeem": ("Success", None),
+                "invariant_exit_withdraw": ("Failure", "invariant_exit_withdraw: broken")}
+        write(self.p("out.json"), json.dumps(out))
+        self.assertEqual(replay._results(self.p("out.json")), want)
+        # A failure's reason may be given only with the failures.
+        for p in next(iter(out.values()))["test_results"]["invariant_exit_max_redeem()"]["invariant_predicate_results"]:
+            p.pop("reason", None)
+        write(self.p("out.json"), json.dumps(out))
+        self.assertEqual(replay._results(self.p("out.json")), want)
+
+    def test_a_search_for_every_exit_finds_each_failure(self):
+        # Seed 1 breaks withdraw, seed 2 the other two, each persisted by name.
+        for seed, failing in ((1, ["invariant_exit_withdraw"]),
+                              (2, ["invariant_exit_redeem", "invariant_exit_max_redeem"])):
+            write(self.p(f"seed{seed}.json"), json.dumps(self.outcome(set(failing))))
+            write(self.p(f"seed{seed}.failing"), "\n".join(failing))
+        write(self.p("forge"), textwrap.dedent(f"""\
+            #!{sys.executable}
+            import json, os, sys
+            seed = sys.argv[sys.argv.index("--fuzz-seed") + 1]
+            d = os.path.join("cache", "invariant", "failures", "AuswegEvalSearch", "invariants")
+            os.makedirs(d, exist_ok=True)
+            for name in open(os.path.join({self.tmp!r}, f"seed{{seed}}.failing")).read().split():
+                with open(os.path.join(d, name), "w") as f:
+                    json.dump({{"call_sequence": [{{"sender": "0x1", "calldata": "0x"}}]}}, f)
+            print(open(os.path.join({self.tmp!r}, f"seed{{seed}}.json")).read())
+            """), 0o755)
+        os.makedirs(self.p("project"))
+        os.makedirs(self.p("logs"))
+        found, campaigns = replay.search(self.p("project"), list(replay.PROPERTIES), time.monotonic() + 30,
+                                         {"campaign_runs": 1, "campaign_depth": 1}, self.p("forge"),
+                                         dict(os.environ), self.p("logs"), self.p("events.jsonl"), 1)
+        self.assertEqual({c: f["seed"] for c, f in found.items()},
+                         {"check_exit_withdraw": 1, "check_exit_redeem": 2, "check_exit_max_redeem": 2})
+        self.assertEqual(found["check_exit_withdraw"]["reason"], "invariant_exit_withdraw: broken")
+        self.assertEqual(campaigns[0]["results"], {"invariant_exit_max_redeem": "Success",
+                                                   "invariant_exit_redeem": "Success",
+                                                   "invariant_exit_withdraw": "Failure"})
+
+
+class EachFailureIsReplayedWhenFound(Tmp):
+    """A confirmation searched for every claimed exit until each failed or the
+    replay budget ended, and only then replayed what it found. A claimed exit
+    the search never broke spent the whole budget, and the failure it had
+    found was never replayed."""
+
+    def test_a_found_failure_is_replayed_before_the_search_goes_on(self):
+        # Seed 1 breaks withdraw; nothing ever breaks redeem.
+        write(self.p("forge"), textwrap.dedent(f"""\
+            #!{sys.executable}
+            import json, os, sys, time
+            a = sys.argv[1:]
+            if "--fuzz-seed" in a:
+                time.sleep(0.2)
+                ran = [n for n in ("invariant_exit_redeem", "invariant_exit_withdraw") if n in a[a.index("--match-test") + 1]]
+                fails = [n for n in ran if n == "invariant_exit_withdraw" and a[a.index("--fuzz-seed") + 1] == "1"]
+                d = os.path.join("cache", "invariant", "failures", "AuswegEvalSearch", "invariants")
+                os.makedirs(d, exist_ok=True)
+                for n in fails:
+                    with open(os.path.join(d, n), "w") as f:
+                        json.dump({{"call_sequence": [{{"sender": "0x1", "calldata": "0x"}}]}}, f)
+                preds = [dict(name=n, status="Failure" if n in fails else "Success") for n in ran]
+                test = {{"status": "Failure" if fails else "Success", "invariant_predicate_results": preds,
+                         "invariant_failures": [dict(name=n, reason="exit withdraw: the call reverted") for n in fails]}}
+                print(json.dumps({{"s:AuswegEvalSearch": {{"test_results": {{ran[0] + "()": test}}}}}}))
+            else:
+                trace = {{"status": "Failure", "reason": "exit withdraw: the call reverted"}}
+                print(json.dumps({{"t:Trace": {{"test_results": {{"test_trace()": trace}}}}}}))
+            """), 0o755)
+        os.makedirs(self.p("project"))
+        os.makedirs(self.p("logs"))
+        run = mock.Mock(cfg={"replay": {"campaign_runs": 1, "campaign_depth": 1, "first_seed": 1}},
+                        forge=self.p("forge"), env=lambda: dict(os.environ), events=self.p("events.jsonl"))
+        abi = [{"type": "constructor", "inputs": [{"name": "asset", "type": "address", "internalType": "contract ERC20"}]}]
+        out = runner.confirm(run, self.p("project"), "src/V.sol", "V", abi, ["check_exit_redeem", "check_exit_withdraw"],
+                             runner.ReplayBudget(runner.MIN_START + 3), self.p("logs"), "target")
+        self.assertTrue(out["check_exit_withdraw"]["confirmed"], out["check_exit_withdraw"].get("why"))
+        self.assertEqual(out["check_exit_withdraw"]["search"]["seed"], 1)
+        self.assertEqual(out["check_exit_redeem"]["why"], "the search found no failure within the budget")
+        self.assertGreater(len(out["check_exit_redeem"]["campaigns"]), 1)
 
 
 class FailedRunsAreNotSurvivors(unittest.TestCase):

@@ -459,8 +459,10 @@ def target_class(result, classes, confirmed):
 
 def confirm(run, project, target_path, contract, abi, checks, budget, logdir, tag, original=None):
     """Search for each exit check's failure from deployment, and replay it,
-    within the target's replay budget. With `original`, a confirmation also
-    needs the replay to pass there."""
+    within the target's replay budget. Each failure is replayed as soon as a
+    campaign finds it, before the search goes on for the others, so a check
+    the search never breaks cannot spend the budget a found one needs. With
+    `original`, a confirmation also needs the replay to pass there."""
     out = {}
     wanted = [c for c in checks if c in replay.PROPERTIES]
     for c in checks:
@@ -475,42 +477,51 @@ def confirm(run, project, target_path, contract, abi, checks, budget, logdir, ta
         return {c: {"confirmed": False, "why": f"no replay: {why}"} for c in wanted} | out
     if original:
         replay.install(original, target_path, contract, abi)
-    spent = {c: {"confirmed": False, "why": "the target's replay budget was spent"} for c in wanted}
-    got, ran = budget.step(lambda deadline: replay.search(
-        project, wanted, deadline, run.cfg["replay"], run.forge, run.env(), logdir, run.events,
-        run.cfg["replay"]["first_seed"]))
-    if not ran:
-        return spent | out
-    found, campaigns = got
-    for c in wanted:
-        if c not in found:
-            out[c] = {"confirmed": False, "why": "the search found no failure within the budget",
-                      "campaigns": campaigns}
-            continue
-        f = found[c]
+
+    def replay_it(c, f, campaigns):
         name = f"AuswegEvalTrace_{re.sub(r'[^A-Za-z0-9_]', '_', tag)}_{c[len('check_exit_'):]}"
         trace = replay.write_trace(project, c, f, name)
         entry = {"search": {"seed": f["seed"], "reason": f["reason"], "calls": len(f["sequence"]),
                             "saved_sequence": f["saved"]},
-                 "trace": trace, "campaigns": campaigns, "confirmed": False}
+                 "trace": trace, "campaigns": list(campaigns), "confirmed": False}
         out[c] = entry
         on_target, ran = budget.step(lambda deadline: replay.run_trace(
             project, trace, name, run.forge, run.env(), deadline, logdir, run.events,
             "mutant" if original else "target"))
         if not ran:
             entry["why"] = "the target's replay budget was spent before the replay"
-            continue
+            return
         entry["on_target"] = on_target
         if not original:
             entry["confirmed"] = on_target["exit_failed"]
-            continue
+            return
         on_original, ran = budget.step(lambda deadline: replay.run_trace(
             original, trace, name, run.forge, run.env(), deadline, logdir, run.events, "original"))
         if not ran:
             entry["why"] = "the target's replay budget was spent before the replay on the original"
-            continue
+            return
         entry["on_original"] = on_original
         entry["confirmed"] = on_target["exit_failed"] and on_original["passed"]
+
+    remaining, campaigns, seed = list(wanted), [], run.cfg["replay"]["first_seed"]
+    while remaining:
+        got, ran = budget.step(lambda deadline: replay.search(
+            project, remaining, deadline, run.cfg["replay"], run.forge, run.env(), logdir, run.events, seed,
+            first=True))
+        if not ran:
+            break
+        found, more = got
+        campaigns += more
+        for c in [c for c in remaining if c in found]:
+            replay_it(c, found[c], campaigns)
+        remaining = [c for c in remaining if c not in found]
+        if not found or not more:
+            break
+        seed = more[-1]["seed"] + 1
+    for c in remaining:
+        out[c] = ({"confirmed": False, "why": "the search found no failure within the budget",
+                   "campaigns": campaigns} if campaigns else
+                  {"confirmed": False, "why": "the target's replay budget was spent"})
     return out
 
 
