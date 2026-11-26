@@ -73,8 +73,13 @@ sha256 = "ee4c6787a95218a571080a599bdf579aca5b0f1e4f27687f70f46d4d12148974"
 #   ausweg's proof of the target, run again with that solver. A check not
 #   started when it is spent is unfinished.
 # - mutation_seconds, by the clock: choosing the functions, Gambit, and every
-#   mutant's copy, build and run, in the sampled order. A mutant not reached
-#   is "not run" and counts as not killed.
+#   mutant's copy, build and run, in the sampled order. Before each mutant
+#   starts, it gets an equal share: the time left divided by the mutants
+#   left, so time one does not use goes to the rest. Its copy, build and run
+#   come out of its share. A mutant whose share is too short to start is
+#   "not run", one stopped at its share's end is inconclusive, and both
+#   count as not killed. The clock waits while a kill is replayed, which is
+#   charged to replay_seconds.
 # - replay_seconds, by the work done: every replay search and replay for one
 #   target and its mutants. Each is charged what it took; nothing else is.
 # So a target takes at most target_seconds + 3 x solver_seconds +

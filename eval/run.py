@@ -21,7 +21,10 @@ Budgets, per target (config.toml, [limits], says the same):
 - solver_seconds, by the clock, for each solver baseline: every check of
   ausweg's proof, run again with that solver. Each solver has its own.
 - mutation_seconds, by the clock: choosing the functions, Gambit, and every
-  mutant's copy, build and run. Nothing in it runs past its end.
+  mutant's copy, build and run. Each mutant gets an equal share of what is
+  left, recomputed before it starts, so time one does not use goes to the
+  rest. The clock waits while a kill is replayed. Nothing in it runs past
+  its end.
 - replay_seconds, by the work done: every replay search and replay for the
   target and its mutants. Each is charged what it took.
 A target therefore takes at most target_seconds + solver_seconds for each
@@ -742,6 +745,14 @@ def finish(res, t, original_hash, started, window):
     return res
 
 
+def share(window, left):
+    """A mutant's share of the mutation budget (Step 23): what is left of it,
+    divided by the `left` mutants not yet tried, so time one does not use goes
+    to those after it. The mutant's copy, build and run come out of its share;
+    a share too short to start leaves the mutant not run."""
+    return Window(max(window.left(), 0.0) / left)
+
+
 def run_mutants(run, t, work, name, abi, classes, replay_budget, logs, hooks, limits):
     window = Window(limits["mutation_seconds"])
     proved = [c for c, v in classes.items() if v == "proved"]
@@ -781,34 +792,50 @@ def run_mutants(run, t, work, name, abi, classes, replay_budget, logs, hooks, li
         if stop_after and kills >= stop_after:
             entry["class"] = "not run: the smoke test stops at its first confirmed kill"
             continue
-        if not window.can_start():
-            entry["class"] = "not run: the mutation budget was spent"
+        mine = share(window, len(picked) - k)
+        entry["share"] = {"allocation_seconds": round(mine.seconds, 3)}
+
+        def stop(why, cls=None):
+            entry["share"].update(seconds=round(time.monotonic() - mine.start, 3), stopped=why)
+            if cls:
+                entry["class"] = cls
+
+        if not mine.can_start():
+            stop("too short to start", "not run: its share of the mutation budget was too short to start")
             continue
         mdir = os.path.join(os.path.dirname(work), "mutants", f"m{k:03d}")
         shutil.rmtree(mdir, ignore_errors=True)
         mutate.copy_project(work, mdir)
         mutate.apply(mdir, mu)
         mlogs = os.path.join(logs, f"mutant{k:03d}")
-        built = build(run, mdir, window.end, mlogs, "build")
+        built = build(run, mdir, mine.end, mlogs, "build")
         if built is None:
-            entry["class"] = "not run: the mutation budget was spent"
+            stop("its share ended in the build", "not run: its share of the mutation budget ended in the build")
             continue
         if built is False:
-            entry["class"] = "does not compile"
+            stop("does not compile", "does not compile")
             continue
-        if not window.can_start():
-            entry["class"] = "not run: the mutation budget was spent"
+        if not mine.can_start():
+            stop("its share ended before the proof",
+                 "not run: its share of the mutation budget ended before the proof")
             continue
-        r = prove(run, mdir, t["contract"], window, mlogs, "prove", mutant=True, only=proved)
+        r = prove(run, mdir, t["contract"], mine, mlogs, "prove", mutant=True, only=proved)
         mclasses = check_classes(r)
         entry["checks"] = mclasses
         entry["run"] = {"status": r["run"]["status"], "returncode": r["run"]["returncode"],
                         "seconds": r["run"]["seconds"], "report": r["report"] is not None}
         cls = mutant_class(r, mclasses, proved)
+        stop("a counterexample" if cls == "counterexample" else
+             "its share ended" if r["run"]["status"] != "exited" or "unfinished" in [mclasses.get(c) for c in proved]
+             else "finished")
         if cls == "counterexample":
             broken = [c for c in proved if mclasses.get(c) == "counterexample"]
+            paused = time.monotonic()
             conf = confirm(run, mdir, t["contract"], name, abi, broken, replay_budget, mlogs, f"m{k:03d}",
                            original=work)
+            # The replays are charged to the replay budget: the mutation clock
+            # waits for them, so they take nothing from the mutants after.
+            window.end += time.monotonic() - paused
             entry["replays"] = conf
             entry["class"] = ("killed, confirmed" if any(v.get("confirmed") for v in conf.values())
                               else "killed, unconfirmed")

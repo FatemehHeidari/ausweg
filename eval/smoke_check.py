@@ -183,6 +183,13 @@ def main():
             else:
                 ev = f"mutants: {mut.get('counts')}"
             check(t["id"], "one Gambit mutant killed and confirmed by the same replay", bool(kills), ev)
+            tried = [m for m in mut.get("mutants", []) if "share" in m]
+            n = len(mut.get("mutants", []))
+            ok = bool(tried) and all({"allocation_seconds", "seconds", "stopped"} <= set(m["share"]) for m in tried)
+            shares = "; ".join(f"mutant {m['n']} of {n}: share {m['share'].get('allocation_seconds')} s, "
+                               f"used {m['share'].get('seconds')} s, {m['share'].get('stopped')}" for m in tried)
+            check(t["id"], "each mutant tried had its share recorded: allocation, time used, why it stopped",
+                  ok, shares or "no mutant tried")
         if e.get("linked_dependency_mutated"):
             ran = [m for m in (r.get("mutation") or {}).get("mutants", []) if m.get("run")]
             linked = [m for m in ran if through_link(t["project"], m["file"])]

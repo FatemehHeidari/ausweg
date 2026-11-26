@@ -261,6 +261,64 @@ class FailedRunsAreNotSurvivors(unittest.TestCase):
         self.assertEqual(runner.mutant_class(r, runner.check_classes(r), r["asked"]), "counterexample")
 
 
+class MutantsShareTheMutationBudget(Tmp):
+    """Mutants ran in order until the mutation hour ended, so a few slow ones
+    could take it all. Each now gets what is left divided by the mutants
+    left, recomputed before it starts (Step 23); a kill's replays are charged
+    to the replay budget, and the mutation clock waits for them."""
+
+    def mutants(self, n, seconds, prove_seconds=0.0, confirm_seconds=0.0, kill=()):
+        picked = [{"file": "src/V.sol", "gambit_id": i, "description": "m", "diff": ""} for i in range(n)]
+        left = []
+
+        def prove(run, mdir, contract, window, logdir, tag, mutant, only):
+            left.append(window.left())
+            time.sleep(prove_seconds)
+            verdict = "counterexample" if int(os.path.basename(mdir)[1:]) in kill else "proved"
+            return {"report": {"reports": [{"checks": [{"name": "check_exit_redeem", "verdict": verdict}]}]},
+                    "checks": [], "asked": list(only), "run": {"status": "exited", "returncode": 0, "seconds": 0}}
+
+        def confirm(*a, **k):
+            time.sleep(confirm_seconds)
+            return {"check_exit_redeem": {"confirmed": True}}
+
+        run = mock.Mock(cfg={"mutation": {"operators": [], "max_mutants": n, "seed": 0},
+                             "tools": {"gambit": {"bin": "gambit"}}})
+        with mock.patch.multiple(runner.mutate, select=lambda *a: [("src/V.sol", "V", "redeem")],
+                                 solc_for=lambda *a: {"path": "solc", "remappings": [], "version": "0.8.20"},
+                                 generate=lambda *a, **k: picked, sample=lambda allm, cap, seed: allm,
+                                 copy_project=lambda *a: None, apply=lambda *a: None), \
+                mock.patch.object(runner, "build", return_value=True), \
+                mock.patch.object(runner, "prove", side_effect=prove), \
+                mock.patch.object(runner, "confirm", side_effect=confirm):
+            out = runner.run_mutants(run, {"contract": "src/V.sol"}, self.p("work"), "V", [],
+                                     {"check_exit_redeem": "proved"}, runner.ReplayBudget(600), self.p("logs"), {},
+                                     {"mutation_seconds": seconds})
+        return out, left
+
+    def test_each_mutant_gets_an_equal_share_of_what_is_left(self):
+        out, left = self.mutants(3, 18, prove_seconds=1)
+        shares = [m["share"]["allocation_seconds"] for m in out["mutants"]]
+        for got, want in zip(shares, (18 / 3, 17 / 2, 16 / 1)):
+            self.assertAlmostEqual(got, want, delta=0.3)
+        for got, share in zip(left, shares):
+            self.assertAlmostEqual(got, share, delta=0.1)
+        self.assertEqual([m["share"]["stopped"] for m in out["mutants"]], ["finished"] * 3)
+        self.assertEqual([round(m["share"]["seconds"]) for m in out["mutants"]], [1, 1, 1])
+
+    def test_a_kills_replays_take_nothing_from_the_mutants_after(self):
+        out, left = self.mutants(2, 12, prove_seconds=0.5, confirm_seconds=3, kill={0})
+        self.assertEqual(out["mutants"][0]["share"]["stopped"], "a counterexample")
+        self.assertEqual(out["mutants"][0]["class"], "killed, confirmed")
+        self.assertAlmostEqual(left[1], 11.5, delta=0.3)
+
+    def test_a_share_too_short_to_start_leaves_the_mutant_not_run(self):
+        out, _ = self.mutants(2, 2 * runner.MIN_START - 1)
+        self.assertEqual(out["mutants"][0]["class"], "not run: its share of the mutation budget was too short to start")
+        self.assertEqual(out["mutants"][0]["share"]["stopped"], "too short to start")
+        self.assertEqual(out["mutants"][1]["share"]["stopped"], "finished")
+
+
 class BudgetsAreUpperBounds(Tmp):
     """With one second left, a mutant build was still given 1,800 seconds,
     and the proof after it a negative budget."""
